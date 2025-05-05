@@ -1,12 +1,19 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { FindManyOptions, Repository } from 'typeorm';
 import { Task } from './entities/task.entity';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
+import { TaskPriority } from './enums/task-priority.enum';
+
+interface UserPayload {
+  id: string;
+  email: string;
+  role: string;
+}
 
 @Injectable()
 export class TasksService {
@@ -16,6 +23,33 @@ export class TasksService {
     @InjectQueue('task-processing')
     private taskQueue: Queue,
   ) {}
+
+  async getStats(user: UserPayload) {
+    // Define query options based on user role
+    const findOptions: FindManyOptions<Task> = {};
+    if (user.role !== 'admin') {
+      // Non-admin users only see their own tasks
+      findOptions.where = { user: { id: user.id } }; // Filter by user ID relationship
+    }
+    // For admins, findOptions remains empty (fetches all tasks)
+
+    // Inefficient approach (fetch all relevant tasks first) - WILL BE OPTIMIZED LATER
+    const tasks = await this.tasksRepository.find(findOptions);
+
+    // Inefficient computation (in-memory filtering) - WILL BE OPTIMIZED LATER
+    const statistics = {
+      total: tasks.length,
+      completed: tasks.filter(t => t.status === TaskStatus.COMPLETED).length,
+      inProgress: tasks.filter(t => t.status === TaskStatus.IN_PROGRESS).length,
+      pending: tasks.filter(t => t.status === TaskStatus.PENDING).length,
+      // Add priority stats if needed, requires TaskPriority enum import
+      highPriority: tasks.filter(t => t.priority === TaskPriority.HIGH).length,
+      mediumPriority: tasks.filter(t => t.priority === TaskPriority.MEDIUM).length,
+      lowPriority: tasks.filter(t => t.priority === TaskPriority.LOW).length,
+    };
+
+    return statistics;
+  }
 
   async create(createTaskDto: CreateTaskDto): Promise<Task> {
     // Inefficient implementation: creates the task but doesn't use a single transaction

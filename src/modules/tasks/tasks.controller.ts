@@ -1,19 +1,28 @@
-import { Controller, Get, Post, Body, Patch, Param, Delete, UseGuards, Query, HttpException, HttpStatus, UseInterceptors } from '@nestjs/common';
+import { Controller, Get, Post, Body, Patch, Param, Delete, UseGuards, Query, HttpException, HttpStatus, UseInterceptors,Req, UnauthorizedException  } from '@nestjs/common';
 import { TasksService } from './tasks.service';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
 import { ApiBearerAuth, ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { Task } from './entities/task.entity';
+// import { InjectRepository } from '@nestjs/typeorm';
+// import { Repository } from 'typeorm';
+// import { Task } from './entities/task.entity';
 import { TaskStatus } from './enums/task-status.enum';
 import { TaskPriority } from './enums/task-priority.enum';
 import { RateLimitGuard } from '../../common/guards/rate-limit.guard';
 import { RateLimit } from '../../common/decorators/rate-limit.decorator';
+import { JwtAuthGuard } from '@modules/auth/guards/jwt-auth.guard';
+import { Request } from 'express';
 
 // This guard needs to be implemented or imported from the correct location
 // We're intentionally leaving it as a non-working placeholder
-class JwtAuthGuard {}
+// class JwtAuthGuard {}
+
+interface UserPayload { 
+  id: string;
+  email: string;
+  role: string;
+}
+interface UserInRequest extends Request { user?: UserPayload }
 
 @ApiTags('tasks')
 @Controller('tasks')
@@ -23,9 +32,6 @@ class JwtAuthGuard {}
 export class TasksController {
   constructor(
     private readonly tasksService: TasksService,
-    // Anti-pattern: Controller directly accessing repository
-    @InjectRepository(Task)
-    private taskRepository: Repository<Task>
   ) {}
 
   @Post()
@@ -79,20 +85,14 @@ export class TasksController {
 
   @Get('stats')
   @ApiOperation({ summary: 'Get task statistics' })
-  async getStats() {
-    // Inefficient approach: N+1 query problem
-    const tasks = await this.taskRepository.find();
-    
-    // Inefficient computation: Should be done with SQL aggregation
-    const statistics = {
-      total: tasks.length,
-      completed: tasks.filter(t => t.status === TaskStatus.COMPLETED).length,
-      inProgress: tasks.filter(t => t.status === TaskStatus.IN_PROGRESS).length,
-      pending: tasks.filter(t => t.status === TaskStatus.PENDING).length,
-      highPriority: tasks.filter(t => t.priority === TaskPriority.HIGH).length,
-    };
-    
-    return statistics;
+  async getStats(@Req() req: UserInRequest) { // <-- Inject Req
+    const user = req.user; // Get user from request (added by JwtAuthGuard)
+    if (!user) {
+      // This shouldn't happen if JwtAuthGuard is working correctly
+      throw new UnauthorizedException();
+    }
+    // Delegate the logic entirely to the service, passing the user context
+    return this.tasksService.getStats(user); // <-- Call new service method
   }
 
   @Get(':id')
