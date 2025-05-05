@@ -143,7 +143,7 @@ export class AuthService {
     if (!user || !user.role) {
       return false;
     }
-
+ 
     // Check if the user's role string is included in the list of required roles
     return requiredRoles.includes(user.role);
   }
