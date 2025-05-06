@@ -755,7 +755,471 @@ describe('TasksService', () => {
     });
 
 });
-  // --- Add describe blocks for other methods (create, findAllPaginated, update, remove, getStats, etc.) ---
 
+describe('remove', () => {
+    const taskId = 'task-uuid-to-remove';
+    const ownerUser: UserPayload = { id: 'user-uuid-owner', email: 'owner@test.com', role: 'user' };
+    const adminUser: UserPayload = { id: 'user-uuid-admin', email: 'admin@test.com', role: 'admin' };
+    const otherUser: UserPayload = { id: 'user-uuid-other', email: 'other@test.com', role: 'user' };
+    const existingTask: Task = {
+        id: taskId, title: 'Task to Remove', description: '', status: TaskStatus.PENDING,
+        priority: TaskPriority.MEDIUM, dueDate: null, userId: ownerUser.id,
+        user: ownerUser as any, createdAt: new Date(), updatedAt: new Date(),
+    };
+    const cacheKey = `task:${taskId}`;
+
+    // Mock references
+    let findOneSpy: jest.SpyInstance;
+    let repoDeleteMock: jest.Mock;
+    let cacheDelMock: jest.Mock;
+
+    beforeEach(() => {
+        jest.clearAllMocks();
+        findOneSpy = jest.spyOn(service, 'findOne');
+        repoDeleteMock = mockTasksRepository.delete; // Use the mock repository delete
+        cacheDelMock = cacheManager.del as jest.Mock;
+    });
+
+    afterEach(() => {
+        findOneSpy.mockRestore();
+    });
+
+    it('should successfully remove task for owner and invalidate cache', async () => {
+        // Arrange
+        findOneSpy.mockResolvedValueOnce(existingTask); // findOne (auth check) succeeds
+        repoDeleteMock.mockResolvedValueOnce({ affected: 1, raw: [] }); // Simulate 1 row deleted
+        cacheDelMock.mockResolvedValueOnce(undefined); // Cache delete succeeds
+
+        // Act
+        await service.remove(taskId, ownerUser);
+
+        // Assert
+        expect(findOneSpy).toHaveBeenCalledWith(taskId, ownerUser); // Check findOne called
+        expect(repoDeleteMock).toHaveBeenCalledWith({ id: taskId }); // Check delete called with ID
+        expect(cacheDelMock).toHaveBeenCalledWith(cacheKey); // Check cache invalidated
+    });
+
+    it('should successfully remove task for admin and invalidate cache', async () => {
+        // Arrange
+        const taskOwnedByOther = { ...existingTask, userId: otherUser.id, user: otherUser as any };
+        findOneSpy.mockResolvedValueOnce(taskOwnedByOther); // findOne succeeds for admin
+        repoDeleteMock.mockResolvedValueOnce({ affected: 1, raw: [] });
+        cacheDelMock.mockResolvedValueOnce(undefined);
+
+        // Act
+        await service.remove(taskId, adminUser);
+
+        // Assert
+        expect(findOneSpy).toHaveBeenCalledWith(taskId, adminUser);
+        expect(repoDeleteMock).toHaveBeenCalledWith({ id: taskId });
+        expect(cacheDelMock).toHaveBeenCalledWith(cacheKey);
+    });
+
+    it('should throw ForbiddenException if non-owner tries to remove', async () => {
+        // Arrange
+        findOneSpy.mockRejectedValueOnce(new ForbiddenException('Forbidden'));
+
+        // Act & Assert
+        await expect(service.remove(taskId, otherUser)).rejects.toThrow(ForbiddenException);
+
+        expect(findOneSpy).toHaveBeenCalledWith(taskId, otherUser);
+        expect(repoDeleteMock).not.toHaveBeenCalled(); // Delete not called
+        expect(cacheDelMock).not.toHaveBeenCalled(); // Cache not invalidated
+    });
+
+    it('should throw NotFoundException if task does not exist', async () => {
+        // Arrange
+        findOneSpy.mockRejectedValueOnce(new NotFoundException('Not Found'));
+
+        // Act & Assert
+        await expect(service.remove(taskId, ownerUser)).rejects.toThrow(NotFoundException);
+
+        expect(findOneSpy).toHaveBeenCalledWith(taskId, ownerUser);
+        expect(repoDeleteMock).not.toHaveBeenCalled();
+        expect(cacheDelMock).not.toHaveBeenCalled();
+    });
+
+     it('should throw NotFoundException if delete operation affects 0 rows', async () => {
+        // Arrange
+        findOneSpy.mockResolvedValueOnce(existingTask); // findOne succeeds
+        repoDeleteMock.mockResolvedValueOnce({ affected: 0, raw: [] }); // Simulate delete affecting 0 rows
+
+        // Act & Assert
+        await expect(service.remove(taskId, ownerUser)).rejects.toThrow(NotFoundException);
+
+        expect(findOneSpy).toHaveBeenCalledWith(taskId, ownerUser);
+        expect(repoDeleteMock).toHaveBeenCalledWith({ id: taskId });
+        expect(cacheDelMock).not.toHaveBeenCalled(); // Cache not invalidated if delete failed
+    });
+
+    it('should complete removal even if cache deletion fails', async () => {
+        // Arrange
+        findOneSpy.mockResolvedValueOnce(existingTask);
+        repoDeleteMock.mockResolvedValueOnce({ affected: 1, raw: [] });
+        cacheDelMock.mockRejectedValueOnce(new Error("Cache DEL failed")); // Cache invalidation fails
+
+        // Act
+        // Should not throw an error from the service.remove call itself
+        await expect(service.remove(taskId, ownerUser)).resolves.toBeUndefined();
+
+        // Assert
+        expect(findOneSpy).toHaveBeenCalledWith(taskId, ownerUser);
+        expect(repoDeleteMock).toHaveBeenCalledWith({ id: taskId });
+        expect(cacheDelMock).toHaveBeenCalledWith(cacheKey); // Invalidation was attempted
+        // We expect a logger.error call for the cache failure
+    });
+
+});
+
+describe('getStats', () => {
+    const regularUser: UserPayload = { id: 'user-uuid-regular', email: 'user@test.com', role: 'user' };
+    const adminUser: UserPayload = { id: 'user-uuid-admin', email: 'admin@test.com', role: 'admin' };
+
+    // Mock the raw result returned by QueryBuilder.getRawOne()
+    const mockRawStatsResult = {
+        total: '5', // Note: getRawOne often returns strings
+        completed: '2',
+        inProgress: '1',
+        pending: '2',
+        highPriority: '1',
+        mediumPriority: '3',
+        lowPriority: '1',
+    };
+
+    // Expected parsed result
+    const expectedStats = {
+        total: 5,
+        completed: 2,
+        inProgress: 1,
+        pending: 2,
+        highPriority: 1,
+        mediumPriority: 3,
+        lowPriority: 1,
+    };
+
+    // Mock the QueryBuilder chainable methods
+    let mockQueryBuilder: any;
+
+    beforeEach(() => {
+        // Reset mocks
+        jest.clearAllMocks();
+
+        // Setup mock query builder chain for each test
+        mockQueryBuilder = {
+            where: jest.fn().mockReturnThis(),
+            select: jest.fn().mockReturnThis(),
+            addSelect: jest.fn().mockReturnThis(),
+            setParameters: jest.fn().mockReturnThis(),
+            getRawOne: jest.fn(), // Mock the final execution method
+        };
+        // Make the repository mock return our mock query builder
+        (mockTasksRepository.createQueryBuilder as jest.Mock).mockReturnValue(mockQueryBuilder);
+    });
+
+
+    it('should build query with user filter and return parsed stats for regular user', async () => {
+        // Arrange
+        mockQueryBuilder.getRawOne.mockResolvedValueOnce(mockRawStatsResult); // Mock DB result
+
+        // Act
+        const result = await service.getStats(regularUser);
+
+        // Assert
+        // 1. Check createQueryBuilder was called
+        expect(mockTasksRepository.createQueryBuilder).toHaveBeenCalledWith('task');
+        // 2. Check WHERE clause was added for the regular user
+        expect(mockQueryBuilder.where).toHaveBeenCalledWith("task.userId = :userId", { userId: regularUser.id });
+        // 3. Check SELECT clauses
+        expect(mockQueryBuilder.select).toHaveBeenCalledWith("COUNT(*)", "total");
+        expect(mockQueryBuilder.addSelect).toHaveBeenCalledTimes(6); // Called for each status/priority aggregation
+        expect(mockQueryBuilder.addSelect).toHaveBeenCalledWith(expect.stringContaining('task.status = :completed'), "completed");
+        expect(mockQueryBuilder.addSelect).toHaveBeenCalledWith(expect.stringContaining('task.priority = :high'), "highPriority");
+        // 4. Check parameters were set (including userId)
+        expect(mockQueryBuilder.setParameters).toHaveBeenCalledWith(expect.objectContaining({
+            completed: TaskStatus.COMPLETED,
+            inProgress: TaskStatus.IN_PROGRESS,
+            pending: TaskStatus.PENDING,
+            high: TaskPriority.HIGH,
+            medium: TaskPriority.MEDIUM,
+            low: TaskPriority.LOW,
+            userId: regularUser.id, // userId should be present
+        }));
+        // 5. Check getRawOne was called
+        expect(mockQueryBuilder.getRawOne).toHaveBeenCalledTimes(1);
+        // 6. Check final parsed result
+        expect(result).toEqual(expectedStats);
+    });
+
+    it('should build query without user filter and return parsed stats for admin user', async () => {
+        // Arrange
+        mockQueryBuilder.getRawOne.mockResolvedValueOnce(mockRawStatsResult);
+
+        // Act
+        const result = await service.getStats(adminUser);
+
+        // Assert
+        expect(mockTasksRepository.createQueryBuilder).toHaveBeenCalledWith('task');
+        // 2. Check WHERE clause was NOT called for admin
+        expect(mockQueryBuilder.where).not.toHaveBeenCalled();
+        // 3. Check SELECT clauses
+        expect(mockQueryBuilder.select).toHaveBeenCalledWith("COUNT(*)", "total");
+        expect(mockQueryBuilder.addSelect).toHaveBeenCalledTimes(6);
+        // 4. Check parameters were set (WITHOUT userId)
+        expect(mockQueryBuilder.setParameters).toHaveBeenCalledWith(expect.objectContaining({
+            completed: TaskStatus.COMPLETED,
+            inProgress: TaskStatus.IN_PROGRESS,
+            pending: TaskStatus.PENDING,
+            high: TaskPriority.HIGH,
+            medium: TaskPriority.MEDIUM,
+            low: TaskPriority.LOW,
+        }));
+        expect(mockQueryBuilder.setParameters).toHaveBeenCalledWith(expect.not.objectContaining({
+            userId: expect.any(String), // Ensure userId is NOT present
+        }));
+        // 5. Check getRawOne was called
+        expect(mockQueryBuilder.getRawOne).toHaveBeenCalledTimes(1);
+        // 6. Check final parsed result
+        expect(result).toEqual(expectedStats);
+    });
+
+    it('should return stats with zeros if query builder returns null/undefined', async () => {
+        // Arrange
+        mockQueryBuilder.getRawOne.mockResolvedValueOnce(null); // Simulate no rows found
+
+        const expectedZeroStats = {
+            total: 0, completed: 0, inProgress: 0, pending: 0,
+            highPriority: 0, mediumPriority: 0, lowPriority: 0,
+        };
+
+        // Act
+        const result = await service.getStats(adminUser); // Use admin for simplicity
+
+        // Assert
+        expect(mockQueryBuilder.getRawOne).toHaveBeenCalledTimes(1);
+        expect(result).toEqual(expectedZeroStats); // Check result defaults to zeros
+    });
+
+});
+  
+describe('batchUpdateStatus', () => {
+    const ownerUser: UserPayload = { id: 'user-uuid-owner', email: 'owner@test.com', role: 'user' };
+    const adminUser: UserPayload = { id: 'user-uuid-admin', email: 'admin@test.com', role: 'admin' };
+    const otherUser: UserPayload = { id: 'user-uuid-other', email: 'other@test.com', role: 'user' };
+
+    const taskIdsOwned = ['task-id-1', 'task-id-2'];
+    const taskIdsMixed = ['task-id-1', 'task-id-other-owner']; // Assume task-id-other-owner belongs to someone else
+    const newStatus = TaskStatus.COMPLETED;
+
+    // Mock references
+    let repoCountMock: jest.Mock;
+    let repoUpdateMock: jest.Mock;
+    let cacheDelMock: jest.Mock;
+
+    beforeEach(() => {
+        // Reset mocks used specifically in this suite
+        repoCountMock = mockTasksRepository.count;
+        repoUpdateMock = mockTasksRepository.update;
+        cacheDelMock = cacheManager.del as jest.Mock;
+    });
+
+    it('should successfully update status for tasks owned by user', async () => {
+        // Arrange
+        // Auth check: count returns the same number as requested IDs
+        repoCountMock.mockResolvedValueOnce(taskIdsOwned.length);
+        // DB update succeeds and affects the expected number of rows
+        repoUpdateMock.mockResolvedValueOnce({ affected: taskIdsOwned.length, raw: [], generatedMaps: [] });
+        // Cache invalidation setup (we don't check its success strictly here)
+        cacheDelMock.mockResolvedValue(undefined);
+
+        // Expected update criteria for owner
+        const expectedUpdateCriteria = {
+            id: In(taskIdsOwned),
+            user: { id: ownerUser.id } // User filter applied
+        };
+
+        // Act
+        const result = await service.batchUpdateStatus(taskIdsOwned, newStatus, ownerUser);
+
+        // Assert
+        expect(repoCountMock).toHaveBeenCalledWith({ where: { id: In(taskIdsOwned), user: { id: ownerUser.id } } }); // Auth check called
+        expect(repoUpdateMock).toHaveBeenCalledWith(expectedUpdateCriteria, { status: newStatus }); // Bulk update called correctly
+        expect(result).toEqual({ affected: taskIdsOwned.length }); // Correct affected count returned
+        expect(cacheDelMock).toHaveBeenCalledTimes(taskIdsOwned.length); // Cache invalidated for each ID
+        expect(cacheDelMock).toHaveBeenCalledWith(`task:${taskIdsOwned[0]}`);
+        expect(cacheDelMock).toHaveBeenCalledWith(`task:${taskIdsOwned[1]}`);
+    });
+
+    it('should successfully update status for tasks as admin (no ownership check)', async () => {
+        // Arrange
+        // No count call expected for admin
+        repoUpdateMock.mockResolvedValueOnce({ affected: taskIdsMixed.length, raw: [], generatedMaps: [] });
+        cacheDelMock.mockResolvedValue(undefined);
+
+        // Expected update criteria for admin (no user filter)
+        const expectedUpdateCriteria = {
+            id: In(taskIdsMixed)
+        };
+
+        // Act
+        const result = await service.batchUpdateStatus(taskIdsMixed, newStatus, adminUser);
+
+        // Assert
+        expect(repoCountMock).not.toHaveBeenCalled(); // Auth check skipped for admin
+        expect(repoUpdateMock).toHaveBeenCalledWith(expectedUpdateCriteria, { status: newStatus });
+        expect(result).toEqual({ affected: taskIdsMixed.length });
+        expect(cacheDelMock).toHaveBeenCalledTimes(taskIdsMixed.length);
+    });
+
+    it('should throw ForbiddenException if non-admin tries to update tasks they do not own', async () => {
+        // Arrange
+        // Auth check: count returns less than the number of requested IDs
+        repoCountMock.mockResolvedValueOnce(1); // User only owns 1 of the 2 tasks
+
+        // Act & Assert
+        await expect(service.batchUpdateStatus(taskIdsMixed, newStatus, ownerUser))
+            .rejects.toThrow(ForbiddenException);
+
+        // Verify auth check was performed, but update/cache invalidation were not
+        expect(repoCountMock).toHaveBeenCalledWith({ where: { id: In(taskIdsMixed), user: { id: ownerUser.id } } });
+        expect(repoUpdateMock).not.toHaveBeenCalled();
+        expect(cacheDelMock).not.toHaveBeenCalled();
+    });
+
+    it('should return affected 0 if update operation affects 0 rows', async () => {
+         // Arrange
+         // Assume user is admin to skip auth check for simplicity
+         repoUpdateMock.mockResolvedValueOnce({ affected: 0, raw: [], generatedMaps: [] }); // Simulate update affecting 0 rows
+         cacheDelMock.mockResolvedValue(undefined);
+
+         // Act
+         const result = await service.batchUpdateStatus(taskIdsOwned, newStatus, adminUser);
+
+         // Assert
+         expect(repoCountMock).not.toHaveBeenCalled();
+         expect(repoUpdateMock).toHaveBeenCalledWith({ id: In(taskIdsOwned) }, { status: newStatus });
+         expect(result).toEqual({ affected: 0 }); // Check affected count is 0
+         expect(cacheDelMock).not.toHaveBeenCalled(); // Cache not invalidated if nothing changed
+    });
+
+});
+describe('batchDelete', () => {
+    const ownerUser: UserPayload = { id: 'user-uuid-owner', email: 'owner@test.com', role: 'user' };
+    const adminUser: UserPayload = { id: 'user-uuid-admin', email: 'admin@test.com', role: 'admin' };
+    const otherUser: UserPayload = { id: 'user-uuid-other', email: 'other@test.com', role: 'user' };
+
+    const taskIdsOwned = ['task-del-1', 'task-del-2'];
+    const taskIdsMixed = ['task-del-1', 'task-del-other']; // Assume task-del-other belongs to someone else
+
+    // Mock references
+    let repoCountMock: jest.Mock;
+    let repoDeleteMock: jest.Mock;
+    let cacheDelMock: jest.Mock;
+
+    beforeEach(() => {
+        // Reset mocks used specifically in this suite
+        repoCountMock = mockTasksRepository.count;
+        repoDeleteMock = mockTasksRepository.delete;
+        cacheDelMock = cacheManager.del as jest.Mock;
+    });
+
+    it('should successfully delete tasks owned by user', async () => {
+        // Arrange
+        // Auth check: count returns the same number as requested IDs
+        repoCountMock.mockResolvedValueOnce(taskIdsOwned.length);
+        // DB delete succeeds and affects the expected number of rows
+        repoDeleteMock.mockResolvedValueOnce({ affected: taskIdsOwned.length, raw: [] });
+        // Cache invalidation setup
+        cacheDelMock.mockResolvedValue(undefined);
+
+        // Expected delete criteria for owner
+        const expectedDeleteCriteria = {
+            id: In(taskIdsOwned),
+            user: { id: ownerUser.id } // User filter applied
+        };
+
+        // Act
+        const result = await service.batchDelete(taskIdsOwned, ownerUser);
+
+        // Assert
+        expect(repoCountMock).toHaveBeenCalledWith({ where: { id: In(taskIdsOwned), user: { id: ownerUser.id } } }); // Auth check called
+        expect(repoDeleteMock).toHaveBeenCalledWith(expectedDeleteCriteria); // Bulk delete called correctly
+        expect(result).toEqual({ affected: taskIdsOwned.length }); // Correct affected count returned
+        expect(cacheDelMock).toHaveBeenCalledTimes(taskIdsOwned.length); // Cache invalidated for each ID
+        expect(cacheDelMock).toHaveBeenCalledWith(`task:${taskIdsOwned[0]}`);
+        expect(cacheDelMock).toHaveBeenCalledWith(`task:${taskIdsOwned[1]}`);
+    });
+
+    it('should successfully delete tasks as admin (no ownership check)', async () => {
+        // Arrange
+        // No count call expected for admin
+        repoDeleteMock.mockResolvedValueOnce({ affected: taskIdsMixed.length, raw: [] });
+        cacheDelMock.mockResolvedValue(undefined);
+
+        // Expected delete criteria for admin (no user filter)
+        const expectedDeleteCriteria = {
+            id: In(taskIdsMixed)
+        };
+
+        // Act
+        const result = await service.batchDelete(taskIdsMixed, adminUser);
+
+        // Assert
+        expect(repoCountMock).not.toHaveBeenCalled(); // Auth check skipped for admin
+        expect(repoDeleteMock).toHaveBeenCalledWith(expectedDeleteCriteria);
+        expect(result).toEqual({ affected: taskIdsMixed.length });
+        expect(cacheDelMock).toHaveBeenCalledTimes(taskIdsMixed.length);
+    });
+
+    it('should throw ForbiddenException if non-admin tries to delete tasks they do not own', async () => {
+        // Arrange
+        // Auth check: count returns less than the number of requested IDs
+        repoCountMock.mockResolvedValueOnce(1); // User only owns 1 of the 2 tasks
+
+        // Act & Assert
+        await expect(service.batchDelete(taskIdsMixed, ownerUser))
+            .rejects.toThrow(ForbiddenException);
+
+        // Verify auth check was performed, but delete/cache invalidation were not
+        expect(repoCountMock).toHaveBeenCalledWith({ where: { id: In(taskIdsMixed), user: { id: ownerUser.id } } });
+        expect(repoDeleteMock).not.toHaveBeenCalled();
+        expect(cacheDelMock).not.toHaveBeenCalled();
+    });
+
+    it('should return affected 0 if delete operation affects 0 rows', async () => {
+         // Arrange
+         // Assume user is admin to skip auth check for simplicity
+         repoDeleteMock.mockResolvedValueOnce({ affected: 0, raw: [] }); // Simulate delete affecting 0 rows
+         cacheDelMock.mockResolvedValue(undefined);
+
+         // Act
+         const result = await service.batchDelete(taskIdsOwned, adminUser);
+
+         // Assert
+         expect(repoCountMock).not.toHaveBeenCalled();
+         expect(repoDeleteMock).toHaveBeenCalledWith({ id: In(taskIdsOwned) });
+         expect(result).toEqual({ affected: 0 }); // Check affected count is 0
+         expect(cacheDelMock).not.toHaveBeenCalled(); // Cache not invalidated if nothing changed
+    });
+
+    it('should attempt cache invalidation even if some deletions fail (best effort)', async () => {
+        // Arrange - Admin deleting, delete succeeds, cache invalidation fails for some
+        repoDeleteMock.mockResolvedValueOnce({ affected: taskIdsOwned.length, raw: [] });
+        // Simulate first cache delete succeeding, second failing
+        cacheDelMock
+            .mockResolvedValueOnce(undefined) // First call ok
+            .mockRejectedValueOnce(new Error("Cache DEL failed")); // Second call fails
+
+        // Act
+        const result = await service.batchDelete(taskIdsOwned, adminUser);
+
+        // Assert
+        expect(result).toEqual({ affected: taskIdsOwned.length }); // DB operation succeeded
+        expect(repoCountMock).not.toHaveBeenCalled();
+        expect(repoDeleteMock).toHaveBeenCalledTimes(1);
+        expect(cacheDelMock).toHaveBeenCalledTimes(taskIdsOwned.length); // Both deletions attempted
+        // Logger should have logged an error for the failed cache delete
+    });
+
+});
 
 });
