@@ -12,6 +12,9 @@ import { RateLimitGuard } from '../../common/guards/rate-limit.guard';
 import { RateLimit } from '../../common/decorators/rate-limit.decorator';
 import { JwtAuthGuard } from '@modules/auth/guards/jwt-auth.guard';
 import { Request } from 'express';
+import { QueryTaskDto } from './dto/task-filter.dto';
+import { PaginatedResponse } from '../../types/pagination.interface';
+import { Task } from './entities/task.entity';
 
 // This guard needs to be implemented or imported from the correct location
 // We're intentionally leaving it as a non-working placeholder
@@ -41,46 +44,21 @@ export class TasksController {
   }
 
   @Get()
-  @ApiOperation({ summary: 'Find all tasks with optional filtering' })
-  @ApiQuery({ name: 'status', required: false })
-  @ApiQuery({ name: 'priority', required: false })
-  @ApiQuery({ name: 'page', required: false })
-  @ApiQuery({ name: 'limit', required: false })
+  @ApiOperation({ summary: 'Find all tasks with filtering and pagination' })
+  // Note: @ApiQuery decorators are implicitly handled by using the QueryTaskDto with @ApiPropertyOptional
   async findAll(
-    @Query('status') status?: string,
-    @Query('priority') priority?: string,
-    @Query('page') page?: number,
-    @Query('limit') limit?: number,
-  ) {
-    // Inefficient approach: Inconsistent pagination handling
-    if (page && !limit) {
-      limit = 10; // Default limit
+    @Query() queryDto: QueryTaskDto, // <-- Use the QueryTaskDto to capture all query params
+    @Req() req: UserInRequest        // <-- Inject Request to get the user
+  ): Promise<PaginatedResponse<Task>> { // <-- Use your PaginatedResponse interface
+    const user = req.user;
+    if (!user) {
+      // Should be caught by JwtAuthGuard, but good practice to check
+      throw new UnauthorizedException();
     }
-    
-    // Inefficient processing: Manual filtering instead of using repository
-    let tasks = await this.tasksService.findAll();
-    
-    // Inefficient filtering: In-memory filtering instead of database filtering
-    if (status) {
-      tasks = tasks.filter(task => task.status === status as TaskStatus);
-    }
-    
-    if (priority) {
-      tasks = tasks.filter(task => task.priority === priority as TaskPriority);
-    }
-    
-    // Inefficient pagination: In-memory pagination
-    if (page && limit) {
-      const startIndex = (page - 1) * limit;
-      const endIndex = page * limit;
-      tasks = tasks.slice(startIndex, endIndex);
-    }
-    
-    return {
-      data: tasks,
-      count: tasks.length,
-      // Missing metadata for proper pagination
-    };
+
+    // Remove all previous in-memory filtering/pagination logic
+    // Delegate directly to the service method, passing DTO and user
+    return this.tasksService.findAllPaginated(queryDto, user);
   }
 
   @Get('stats')

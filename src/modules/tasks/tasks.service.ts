@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { FindManyOptions, Repository } from 'typeorm';
+import { FindManyOptions, FindOptionsWhere, Repository } from 'typeorm';
 import { Task } from './entities/task.entity';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
@@ -8,6 +8,8 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
 import { TaskPriority } from './enums/task-priority.enum';
+import { PaginatedResponse } from '../../types/pagination.interface';
+import { QueryTaskDto } from './dto/task-filter.dto';
 
 interface UserPayload {
   id: string;
@@ -66,12 +68,73 @@ export class TasksService {
     return savedTask;
   }
 
-  async findAll(): Promise<Task[]> {
-    // Inefficient implementation: retrieves all tasks without pagination
-    // and loads all relations, causing potential performance issues
-    return this.tasksRepository.find({
-      relations: ['user'],
-    });
+// --- NEW METHOD for Paginated/Filtered FindAll ---
+  /**
+   * Finds tasks with pagination, filtering, and user-based access control.
+   * @param queryDto DTO containing pagination and filter parameters.
+   * @param user The authenticated user payload.
+   * @returns A paginated result set of tasks.
+   */
+  async findAllPaginated(
+    queryDto: QueryTaskDto,
+    user: UserPayload,
+  ): Promise<PaginatedResponse<Task>> {
+    // Destructure DTO, applying defaults if necessary (defaults are set in DTO)
+    const { page = 1, limit = 10, status, priority /*, sortBy, sortOrder, search */ } = queryDto;
+    const skip = (page - 1) * limit;
+
+    // Start building the WHERE clause for the query
+    const whereClause: FindOptionsWhere<Task> = {};
+
+    // Filter by user ID ONLY if the user is NOT an admin
+    if (user.role !== 'admin') {
+      whereClause.user = { id: user.id };
+    }
+
+    // Add status filter if provided
+    if (status) {
+      whereClause.status = status;
+    }
+
+    // Add priority filter if provided
+    if (priority) {
+      whereClause.priority = priority;
+    }
+
+    // TODO: Add search filter if implementing search (e.g., using ILIKE on title/description)
+    // if (search) {
+    //   whereClause.title = ILike(`%${search}%`); // Example, may need array for multiple conditions
+    // }
+
+    // Build the main options object for TypeORM's findAndCount
+    const findOptions: FindManyOptions<Task> = {
+      where: whereClause,
+      relations: { user: true }, // Eager load user details (consider if always needed)
+      take: limit, // Apply limit (items per page)
+      skip: skip, // Apply offset (for pagination)
+      order: {
+        createdAt: 'DESC', // Default sort order (newest first)
+        // TODO: Add dynamic sorting based on DTO params `sortBy`, `sortOrder` if implemented
+        // ...(sortBy && sortOrder && { [sortBy]: sortOrder }),
+      },
+    };
+
+    // Execute the query using findAndCount to get tasks and total count efficiently
+    const [tasks, totalItems] = await this.tasksRepository.findAndCount(findOptions);
+
+    // Calculate pagination metadata
+    const totalPages = Math.ceil(totalItems / limit);
+
+    // Structure the response according to your PaginatedResponse<T> interface
+    return {
+      data: tasks,
+      meta: {
+        total: totalItems,    // Use 'total' as per your interface
+        page: page,         // Use 'page' as per your interface
+        limit: limit,       // Use 'limit' as per your interface
+        totalPages: totalPages, // Use 'totalPages' as per your interface
+      },
+    };
   }
 
   async findOne(id: string): Promise<Task> {
