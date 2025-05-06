@@ -1,9 +1,15 @@
-import { Column, CreateDateColumn, Entity, JoinColumn, ManyToOne, PrimaryGeneratedColumn, UpdateDateColumn } from 'typeorm';
+import {
+  Column, CreateDateColumn, Entity, Index, // <-- Import Index
+  JoinColumn, ManyToOne, PrimaryGeneratedColumn, UpdateDateColumn
+} from 'typeorm';
 import { User } from '../../users/entities/user.entity';
 import { TaskStatus } from '../enums/task-status.enum';
 import { TaskPriority } from '../enums/task-priority.enum';
 
 @Entity('tasks')
+// Optional: Define multi-column indexes at the class level if needed later
+// @Index(["userId", "status"]) // Example multi-column index
+// @Index(["userId", "createdAt"]) // Example multi-column index
 export class Task {
   @PrimaryGeneratedColumn('uuid')
   id: string;
@@ -14,6 +20,7 @@ export class Task {
   @Column({ type: 'text', nullable: true })
   description: string;
 
+  @Index() // <-- Add index for status filtering/aggregation
   @Column({
     type: 'enum',
     enum: TaskStatus,
@@ -21,6 +28,7 @@ export class Task {
   })
   status: TaskStatus;
 
+  @Index() // <-- Add index for priority filtering/aggregation
   @Column({
     type: 'enum',
     enum: TaskPriority,
@@ -28,9 +36,15 @@ export class Task {
   })
   priority: TaskPriority;
 
-  @Column({ name: 'due_date', nullable: true })
-  dueDate: Date;
+  @Index()
+  @Column({
+    name: 'due_date',
+    nullable: true,
+    type: 'timestamp', // <-- Explicitly set the database column type
+  })
+  dueDate: Date | null; // Keep TypeScript type as Date | null
 
+  @Index() // <-- CRITICAL: Add index for filtering/joining by user
   @Column({ name: 'user_id' })
   userId: string;
 
@@ -38,9 +52,10 @@ export class Task {
   @JoinColumn({ name: 'user_id' })
   user: User;
 
+  @Index() // <-- Add index for default sorting
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 
   @UpdateDateColumn({ name: 'updated_at' })
   updatedAt: Date;
-} 
+}

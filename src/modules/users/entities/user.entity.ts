@@ -20,6 +20,10 @@ export class User {
   @Column({ default: 'user' })
   role: string;
 
+  @Column({ name: 'hashed_refresh_token', type: 'varchar', nullable: true })
+  @Exclude() // Exclude refresh token hash
+  hashedRefreshToken?: string | null;
+  
   @OneToMany(() => Task, (task) => task.user)
   tasks: Task[];
 
