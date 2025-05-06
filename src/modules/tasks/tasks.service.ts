@@ -242,7 +242,7 @@ export class TasksService {
 
     }); // End transaction block
   }
-  
+
 // --- REMOVE (Optimize fetch & Add Auth Check) ---
 async remove(id: string, user: UserPayload): Promise<void> { // <-- Accept UserPayload
   // Fetch the task first, ensuring it exists and checking auth in one go
@@ -254,20 +254,33 @@ async remove(id: string, user: UserPayload): Promise<void> { // <-- Accept UserP
  // No return value needed for remove
 }
 
-  // --- FIND BY STATUS (Add Auth Check - Needs further refactor later) ---
-  async findByStatus(status: TaskStatus, user: UserPayload): Promise<Task[]> { // <-- Accept UserPayload
-    // TODO: Refactor to use QueryBuilder or find options
-    const baseQuery = 'SELECT * FROM tasks WHERE status = $1';
-    let finalQuery = baseQuery;
-    const queryParams: any[] = [status];
+ // --- REFACTORED findByStatus METHOD ---
+  /**
+   * Finds tasks by status, respecting user ownership for non-admins.
+   * @param status The status to filter by.
+   * @param user The authenticated user payload.
+   * @returns A promise resolving to an array of tasks.
+   */
+  async findByStatus(status: TaskStatus, user: UserPayload): Promise<Task[]> {
+    // Build the WHERE clause dynamically
+    const whereClause: FindOptionsWhere<Task> = {
+        status: status // Filter by the provided status
+    };
 
+    // Add user filtering ONLY if the user is NOT an admin
     if (user.role !== 'admin') {
-      finalQuery += ' AND user_id = $2';
-      queryParams.push(user.id);
+      whereClause.user = { id: user.id };
     }
 
-    return this.tasksRepository.query(finalQuery, queryParams);
+    // Use the repository's find method with the constructed where clause
+    // Include relations if typically needed by the caller, consistent with findOne/findAllPaginated
+    return this.tasksRepository.find({
+        where: whereClause,
+        relations: { user: true }, // Load user relation if needed
+        order: { createdAt: 'DESC' } // Optional: Add default sorting
+    });
   }
+  // --- END REFACTORED findByStatus METHOD ---
 
   // --- UPDATE STATUS (Needs Auth Consideration) ---
   async updateStatus(id: string, status: string): Promise<Task> {
