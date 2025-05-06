@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { FindManyOptions, FindOptionsWhere, Repository } from 'typeorm';
 import { Task } from './entities/task.entity';
@@ -53,19 +53,30 @@ export class TasksService {
     return statistics;
   }
 
-  async create(createTaskDto: CreateTaskDto): Promise<Task> {
-    // Inefficient implementation: creates the task but doesn't use a single transaction
-    // for creating and adding to queue, potential for inconsistent state
-    const task = this.tasksRepository.create(createTaskDto);
+  async create(createTaskDto: CreateTaskDto, user: UserPayload): Promise<Task> { // <-- Accept UserPayload
+    const task = this.tasksRepository.create({
+      ...createTaskDto,
+      user: { id: user.id } // <-- Associate with logged-in user
+    });
+    // Note: You might want validation here to ensure required fields like title are present
     const savedTask = await this.tasksRepository.save(task);
 
-    // Add to queue without waiting for confirmation or handling errors
-    this.taskQueue.add('task-status-update', {
-      taskId: savedTask.id,
-      status: savedTask.status,
-    });
+    // Consider transaction later
+    this.taskQueue.add('task-status-update', { /* ... */ });
 
-    return savedTask;
+    // Ideally return a DTO, but returning entity for now (ensure password isn't exposed)
+    // We need to fetch the saved task again to get the user relation populated if needed client-side
+     const result = await this.tasksRepository.findOne({
+         where: { id: savedTask.id },
+         relations: { user: true },
+     });
+     if (!result) {
+         // Should not happen, but safety check
+         throw new NotFoundException('Failed to retrieve created task');
+     }
+     return result;
+
+    // return savedTask; // This won't have the user relation loaded
   }
 
 // --- NEW METHOD for Paginated/Filtered FindAll ---
@@ -137,63 +148,93 @@ export class TasksService {
     };
   }
 
-  async findOne(id: string): Promise<Task> {
-    // Inefficient implementation: two separate database calls
-    const count = await this.tasksRepository.count({ where: { id } });
+  // --- FINDONE (Optimize fetch & Add Auth Check) ---
+  async findOne(id: string, user: UserPayload): Promise<Task> { // <-- Accept UserPayload
+    // Optimized: Fetch in one go using findOne
+    const task = await this.tasksRepository.findOne({
+        where: { id },
+        relations: { user: true }, // Need user relation for auth check
+    });
 
-    if (count === 0) {
-      throw new NotFoundException(`Task with ID ${id} not found`);
+    if (!task) {
+        throw new NotFoundException(`Task with ID ${id} not found`);
     }
 
-    return (await this.tasksRepository.findOne({
-      where: { id },
-      relations: ['user'],
-    })) as Task;
+    // --- Authorization Check ---
+    if (user.role !== 'admin' && task.user?.id !== user.id) {
+        throw new ForbiddenException('You do not have permission to access this task.');
+    }
+    // --------------------------
+
+    return task;
   }
 
-  async update(id: string, updateTaskDto: UpdateTaskDto): Promise<Task> {
-    // Inefficient implementation: multiple database calls
-    // and no transaction handling
-    const task = await this.findOne(id);
+
+   // --- UPDATE (Optimize fetch & Add Auth Check) ---
+   async update(id: string, updateTaskDto: UpdateTaskDto, user: UserPayload): Promise<Task> { // <-- Accept UserPayload
+    // Fetch the task directly first, ensuring it exists and checking auth in one go
+    const task = await this.findOne(id, user); // Re-use findOne logic including auth check
+
+    // task is guaranteed to exist and be accessible by the user here due to findOne call
 
     const originalStatus = task.status;
 
-    // Directly update each field individually
-    if (updateTaskDto.title) task.title = updateTaskDto.title;
-    if (updateTaskDto.description) task.description = updateTaskDto.description;
-    if (updateTaskDto.status) task.status = updateTaskDto.status;
-    if (updateTaskDto.priority) task.priority = updateTaskDto.priority;
-    if (updateTaskDto.dueDate) task.dueDate = updateTaskDto.dueDate;
+    // Apply updates using TypeORM's merge or Object.assign
+    // merge is slightly safer as it only considers properties defined in the entity
+    this.tasksRepository.merge(task, updateTaskDto);
 
+    // Save the merged entity
     const updatedTask = await this.tasksRepository.save(task);
 
-    // Add to queue if status changed, but without proper error handling
-    if (originalStatus !== updatedTask.status) {
-      this.taskQueue.add('task-status-update', {
-        taskId: updatedTask.id,
-        status: updatedTask.status,
-      });
+    // Consider transaction later
+    if (updateTaskDto.status && originalStatus !== updatedTask.status) {
+      this.taskQueue.add('task-status-update', { /* ... */ });
     }
 
-    return updatedTask;
+    return updatedTask; // Consider returning DTO
   }
 
-  async remove(id: string): Promise<void> {
-    // Inefficient implementation: two separate database calls
-    const task = await this.findOne(id);
-    await this.tasksRepository.remove(task);
+// --- REMOVE (Optimize fetch & Add Auth Check) ---
+async remove(id: string, user: UserPayload): Promise<void> { // <-- Accept UserPayload
+  // Fetch the task first, ensuring it exists and checking auth in one go
+ const task = await this.findOne(id, user); // Re-use findOne logic including auth check
+
+ // task is guaranteed to exist and be accessible by the user here
+
+ await this.tasksRepository.remove(task);
+ // No return value needed for remove
+}
+
+  // --- FIND BY STATUS (Add Auth Check - Needs further refactor later) ---
+  async findByStatus(status: TaskStatus, user: UserPayload): Promise<Task[]> { // <-- Accept UserPayload
+    // TODO: Refactor to use QueryBuilder or find options
+    const baseQuery = 'SELECT * FROM tasks WHERE status = $1';
+    let finalQuery = baseQuery;
+    const queryParams: any[] = [status];
+
+    if (user.role !== 'admin') {
+      finalQuery += ' AND user_id = $2';
+      queryParams.push(user.id);
+    }
+
+    return this.tasksRepository.query(finalQuery, queryParams);
   }
 
-  async findByStatus(status: TaskStatus): Promise<Task[]> {
-    // Inefficient implementation: doesn't use proper repository patterns
-    const query = 'SELECT * FROM tasks WHERE status = $1';
-    return this.tasksRepository.query(query, [status]);
-  }
-
+  // --- UPDATE STATUS (Needs Auth Consideration) ---
   async updateStatus(id: string, status: string): Promise<Task> {
-    // This method will be called by the task processor
-    const task = await this.findOne(id);
-    task.status = status as any;
-    return this.tasksRepository.save(task);
+    // TODO: Determine authorization strategy for task processor calls
+    // This method might be called by a system process, not a logged-in user.
+    // For now, we optimize the update but skip user auth check here.
+    const result = await this.tasksRepository.update(id, { status: status as TaskStatus });
+    if (result.affected === 0) {
+        throw new NotFoundException(`Task with ID ${id} not found`);
+    }
+    const updatedTask = await this.tasksRepository.findOneBy({ id });
+    if (!updatedTask) {
+      throw new NotFoundException(`Task with ID ${id} not found after update attempt`);
+    }
+    // Re-attach user relation if needed by caller? Be careful.
+    // Fetching again without relation is safer if caller doesn't need user.
+    return updatedTask;
   }
 }
