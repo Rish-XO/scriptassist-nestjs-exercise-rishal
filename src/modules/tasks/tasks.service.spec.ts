@@ -15,6 +15,7 @@ import { NotFoundException, ForbiddenException } from '@nestjs/common';
 import { TaskStatus } from './enums/task-status.enum';
 import { TaskPriority } from './enums/task-priority.enum';
 import { QueryTaskDto } from './dto/task-filter.dto';
+import { CreateTaskDto } from './dto/create-task.dto';
 
 // Define UserPayload or import if defined globally
 interface UserPayload { id: string; email: string; role: string; }
@@ -410,6 +411,133 @@ describe('TasksService', () => {
         expect(result.data).toEqual([]);
         expect(result.meta).toEqual(expectedMeta);
      });
+
+
+     describe('create', () => {
+        const userPayload: UserPayload = { id: 'user-uuid-creator', email: 'creator@test.com', role: 'user' };
+        const createTaskDto: CreateTaskDto = {
+          title: 'New Test Task',
+          description: 'Description for test',
+          priority: TaskPriority.LOW,
+          // status and dueDate might be optional with defaults
+        };
+    
+        // Mock what the repository.create returns (doesn't have ID/timestamps yet)
+        const mockCreatedTaskPartial = {
+            ...createTaskDto,
+            user: { id: userPayload.id },
+            status: TaskStatus.PENDING, // Assume default or from DTO
+            priority: createTaskDto.priority || TaskPriority.MEDIUM, // Assume default or from DTO
+        };
+    
+        // Mock what repository.save returns (has ID/timestamps)
+        const mockSavedTask = {
+            ...mockCreatedTaskPartial,
+            id: 'new-task-uuid-123',
+            createdAt: new Date(),
+            updatedAt: new Date(),
+        };
+    
+         // Mock what the final findOne returns (includes full user relation if needed)
+         const mockFinalTaskResult = {
+             ...mockSavedTask,
+             user: { id: userPayload.id, email: userPayload.email, name: 'Test Creator', role: userPayload.role } as User // Cast for typing
+         };
+    
+    
+         it('should create a task, save it, add to queue within a transaction, and return the saved task', async () => {
+            // Arrange
+            const mockTransactionalEntityManager = {
+              create: jest.fn().mockReturnValue(mockCreatedTaskPartial),
+              save: jest.fn().mockResolvedValue(mockSavedTask), // save returns the saved task
+            };
+            // Mock the transaction - return result of callback
+            (dataSource.transaction as jest.Mock).mockImplementationOnce(async (callback) => {
+               return callback(mockTransactionalEntityManager); // Executes callback and returns its result
+            });
+            // Mock queue add
+            mockTaskQueue.add.mockResolvedValue({ id: 'job-123' });
+            // NO mock needed for the final tasksRepository.findOne
+  
+            // Act
+            const result = await service.create(createTaskDto, userPayload);
+  
+            // Assert
+            expect(mockDataSource.transaction).toHaveBeenCalledTimes(1);
+            expect(mockTransactionalEntityManager.create).toHaveBeenCalledWith(Task, expect.any(Object));
+            expect(mockTransactionalEntityManager.save).toHaveBeenCalledWith(Task, mockCreatedTaskPartial);
+            expect(mockTaskQueue.add).toHaveBeenCalledWith('task-status-update', expect.any(Object));
+            // Verify the findOne call using the main repository mock is NOT called
+            expect(mockTasksRepository.findOne).not.toHaveBeenCalled();
+            // Verify the final result IS the saved task from the transaction
+            expect(result).toEqual(mockSavedTask); // <-- Check against mockSavedTask
+          });
+    
+        it('should throw error and rollback transaction if queue add fails', async () => {
+           // Arrange
+           const queueError = new Error('Redis connection failed');
+           const mockTransactionalEntityManager = {
+             create: jest.fn().mockReturnValue(mockCreatedTaskPartial),
+             save: jest.fn().mockResolvedValue(mockSavedTask),
+           };
+            (dataSource.transaction as jest.Mock).mockImplementationOnce(async (callback) => {
+                // Need to simulate the TX manager behaviour of rolling back on error
+                try {
+                    await callback(mockTransactionalEntityManager);
+                } catch (error) {
+                    // Simulate rollback would happen here
+                    throw error; // Re-throw the error caught by the TX manager
+                }
+            });
+    
+           // Mock queue add to reject
+           mockTaskQueue.add.mockRejectedValue(queueError);
+    
+           // Act & Assert
+           // Expect the service call to throw the wrapped error from the catch block
+           await expect(service.create(createTaskDto, userPayload))
+           .rejects.toThrow('Redis connection failed');
+    
+           // Verify transaction, create, save were called, but final findOne was not
+           expect(mockDataSource.transaction).toHaveBeenCalledTimes(1);
+           expect(mockTransactionalEntityManager.create).toHaveBeenCalled();
+           expect(mockTransactionalEntityManager.save).toHaveBeenCalled();
+           expect(mockTaskQueue.add).toHaveBeenCalled(); // Queue add was attempted
+           expect(mockTasksRepository.findOne).not.toHaveBeenCalled(); // Final fetch shouldn't happen
+    
+         });
+    
+         it('should throw error and rollback transaction if db save fails', async () => {
+           // Arrange
+           const dbError = new Error('Database constraint violation');
+           const mockTransactionalEntityManager = {
+             create: jest.fn().mockReturnValue(mockCreatedTaskPartial),
+             save: jest.fn().mockRejectedValue(dbError), // Simulate save failing
+           };
+            (dataSource.transaction as jest.Mock).mockImplementationOnce(async (callback) => {
+                try {
+                    await callback(mockTransactionalEntityManager);
+                } catch (error) {
+                    throw error;
+                }
+            });
+    
+    
+           // Act & Assert
+           // Expect the service call to reject with the original DB error
+           await expect(service.create(createTaskDto, userPayload))
+             .rejects.toThrow(dbError);
+    
+           // Verify transaction, create, save attempted, queue/final findOne not called
+           expect(mockDataSource.transaction).toHaveBeenCalledTimes(1);
+           expect(mockTransactionalEntityManager.create).toHaveBeenCalled();
+           expect(mockTransactionalEntityManager.save).toHaveBeenCalled();
+           expect(mockTaskQueue.add).not.toHaveBeenCalled();
+           expect(mockTasksRepository.findOne).not.toHaveBeenCalled();
+         });
+    
+      });
+        
 
   });
 

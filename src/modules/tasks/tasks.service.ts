@@ -76,42 +76,35 @@ export class TasksService {
     return statistics;
   }
 
-  // --- CREATE (With Transaction) ---
-  async create(createTaskDto: CreateTaskDto, user: UserPayload): Promise<Task> {
-    // Caching Note: Create operations usually invalidate list caches, but we don't cache lists here yet.
-    return this.dataSource.transaction(async (transactionalEntityManager) => {
-      const task = transactionalEntityManager.create(Task, {
-        ...createTaskDto,
-        user: { id: user.id }
-      });
-      const savedTask = await transactionalEntityManager.save(Task, task);
-      try {
-        await this.taskQueue.add('task-status-update', {
-             taskId: savedTask.id,
-             status: savedTask.status,
-         });
-      } catch (queueError) {
-        if (queueError instanceof Error) {
-          this.logger.error(
-            `Failed to add task ${savedTask.id} to queue (TX WILL ROLLBACK): ${queueError.message}`,
-            queueError.stack
-          );
-        } else {
-          this.logger.error(
-            `Failed to add task ${savedTask.id} to queue (TX WILL ROLLBACK): Unknown error`,
-            String(queueError)
-          );
+   // --- CORRECTED create METHOD ---
+   async create(createTaskDto: CreateTaskDto, user: UserPayload): Promise<Task> {
+    // Start the transaction
+    const savedTask = await this.dataSource.transaction(async (transactionalEntityManager) => {
+        const task = transactionalEntityManager.create(Task, {
+            ...createTaskDto,
+            user: { id: user.id } // Associate user ID
+        });
+        // Save using the transactional entity manager
+        const saved = await transactionalEntityManager.save(Task, task);
+
+        // Add job to queue within transaction
+        try {
+            await this.taskQueue.add('task-status-update', { taskId: saved.id, status: saved.status });
+        } catch (queueError) { // Handle queue errors and rollback
+             let qErrorMessage = `Failed to add task ${saved.id} to queue.`;
+             if (queueError instanceof Error) {
+                this.logger.error(`Failed to add task to queue (TX WILL ROLLBACK): ${queueError.message}`, queueError.stack);
+                qErrorMessage = queueError.message;
+             } else {
+                this.logger.error(`Failed to add task to queue (TX WILL ROLLBACK) with non-Error type: ${JSON.stringify(queueError)}`);
+             }
+            throw new Error(qErrorMessage); // This error rolls back the transaction
         }
-        throw new Error(`Failed to queue task update for ${savedTask.id}.`);
-      }
-      // Fetch again to return entity with relations possibly needed by client
-      const result = await transactionalEntityManager.findOne(Task, { // Use TX manager to read within TX
-           where: { id: savedTask.id },
-           relations: { user: true },
-       });
-       if (!result) throw new NotFoundException('Failed to retrieve created task after save.');
-       return result;
-    });
+
+        return saved; // <-- Return the result of 'save' directly from the transaction callback
+    }); // End transaction block
+    
+    return savedTask;
   }
 
   // --- FINDALLPAGINATED (Optimized - No Caching) ---
