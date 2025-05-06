@@ -1,7 +1,10 @@
+// src/modules/auth/auth.service.ts
+
 import {
   ConflictException,
+  ForbiddenException, // Make sure this is imported
   Injectable,
-  NotFoundException, // Import NotFoundException if needed for validateUser logic refinement
+  NotFoundException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { JwtService } from '@nestjs/jwt';
@@ -9,61 +12,85 @@ import { UsersService } from '../users/users.service';
 import { LoginDto } from './dto/login.dto';
 import { RegisterDto } from './dto/register.dto';
 import * as bcrypt from 'bcrypt';
-import { User } from '../users/entities/user.entity'; // Import the User entity type
-import { ConfigService } from '@nestjs/config';
+import { User } from '../users/entities/user.entity';
+import { ConfigService } from '@nestjs/config'; // Make sure this is imported
 
 @Injectable()
 export class AuthService {
   constructor(
     private readonly usersService: UsersService,
-    private readonly jwtService: JwtService, // This service uses config from AuthModule (access token secret/expiry)
-    private readonly configService: ConfigService,
+    private readonly jwtService: JwtService, // Configured in AuthModule for ACCESS tokens
+    private readonly configService: ConfigService, // Injected to get REFRESH token config
   ) {}
 
+  // --- Token Generation Helpers ---
+
   /**
-   * Generates a JWT access token with a consistent payload.
-   * @param user The user object containing id, email, and role.
-   * @returns The signed JWT access token string.
+   * Generates a JWT access token.
+   * Uses configuration loaded via ConfigModule ('jwt.accessSecret', 'jwt.accessExpiresIn').
    */
   private generateAccessToken(user: User): string {
     const payload = {
-      sub: user.id,       // User ID as the subject
-      email: user.email,  // User email
-      role: user.role     // User role
+      sub: user.id,
+      email: user.email,
+      role: user.role,
     };
-    // Uses the secret and expiration defined in JwtModule registration within AuthModule
+    // Sign using the default secret/expiry configured for JwtService in AuthModule
+    // Assumes JwtModule.registerAsync in AuthModule uses 'jwt.accessSecret' and 'jwt.accessExpiresIn'
     return this.jwtService.sign(payload);
   }
 
-  
+  /**
+   * Generates a JWT refresh token.
+   * Uses specific refresh token configuration from ConfigService.
+   */
+  private generateRefreshToken(user: User): string {
+    const payload = { sub: user.id }; // Refresh token payload often just needs user ID
+    return this.jwtService.sign(payload, {
+      secret: this.configService.get<string>('jwt.refreshSecret'), // Use REFRESH secret
+      expiresIn: this.configService.get<string>('jwt.refreshExpiresIn'), // Use REFRESH expiry
+    });
+  }
 
   /**
-   * Authenticates a user based on email and password.
-   * @param loginDto DTO containing email and password.
-   * @returns An object containing the access token and filtered user details.
+   * Hashes and stores the refresh token for a user.
    */
-  async login(loginDto: LoginDto): Promise<{ access_token: string, user: Partial<User> }> {
+  private async updateRefreshTokenHash(userId: string, refreshToken: string | null): Promise<void> {
+      // If refreshToken is null (logout), store null. Otherwise, hash it.
+      const hashedRefreshToken = refreshToken ? await bcrypt.hash(refreshToken, 10) : null;
+      // Assumes usersService.updateRefreshToken correctly updates the DB field
+      await this.usersService.updateRefreshToken(userId, hashedRefreshToken);
+  }
+
+  // --- Core Auth Methods ---
+
+  /**
+   * Authenticates a user, generates tokens, and stores refresh token hash.
+   */
+  async login(loginDto: LoginDto): Promise<{ access_token: string, refresh_token: string, user: Partial<User> }> {
     const { email, password } = loginDto;
     const user = await this.usersService.findByEmail(email);
 
-    // Avoid user enumeration: check user existence and password validity before throwing.
     let passwordValid = false;
     if (user) {
-      // Only compare password if user exists
       passwordValid = await bcrypt.compare(password, user.password);
     }
 
-    // Throw generic error if user doesn't exist OR password doesn't match
     if (!user || !passwordValid) {
       throw new UnauthorizedException('Invalid credentials');
     }
 
-    // Generate the access token using the common method
+    // Generate tokens
     const accessToken = this.generateAccessToken(user);
+    const refreshToken = this.generateRefreshToken(user);
+
+    // Store hashed refresh token
+    await this.updateRefreshTokenHash(user.id, refreshToken);
 
     return {
       access_token: accessToken,
-      user: { // Return filtered public user data
+      refresh_token: refreshToken, // Return plain refresh token to client
+      user: { // Return filtered user data
         id: user.id,
         email: user.email,
         role: user.role,
@@ -72,79 +99,92 @@ export class AuthService {
   }
 
   /**
-   * Registers a new user and automatically logs them in.
-   * @param registerDto DTO containing registration details.
-   * @returns An object containing the access token and filtered user details.
+   * Registers a new user. Returns user data but NO tokens (user must login separately).
    */
-  async register(registerDto: RegisterDto): Promise<{ access_token: string, user: Partial<User> }> {
+  async register(registerDto: RegisterDto): Promise<{ user: Partial<User> }> {
     const existingUser = await this.usersService.findByEmail(registerDto.email);
-
     if (existingUser) {
-      // Use ConflictException for duplicate email
       throw new ConflictException('Email already exists');
     }
 
-    // usersService.create handles hashing and returns the full user object
+    // usersService.create handles hashing and saves the user
     const user = await this.usersService.create(registerDto);
 
-    // Generate the access token using the common method
-    const accessToken = this.generateAccessToken(user);
-
+    // Return filtered user data (NO token here)
     return {
-      access_token: accessToken, // Return token with consistent key
-      user: { // Return filtered public user data
+      user: {
         id: user.id,
         email: user.email,
-        name: user.name, // Include name as it's often useful info
+        name: user.name, // Ensure name is included if available on user object
         role: user.role,
       },
     };
   }
 
   /**
-   * Validates if a user exists based on ID.
-   * (Note: This method might not be directly used by the provided JwtStrategy,
-   * which calls usersService.findOne itself, but kept for potential other uses).
-   * @param userId The ID of the user to validate.
-   * @returns The User object if found, otherwise null (or handle NotFoundException).
+   * Logs out a user by clearing their stored refresh token hash.
    */
-   async validateUser(userId: string): Promise<User | null> {
-    try {
-       const user = await this.usersService.findOne(userId);
-       return user; // findOne throws if not found based on UsersService code
-    } catch (error) {
-       // If findOne throws NotFoundException specifically, treat as null user for validation
-       if (error instanceof NotFoundException) {
-          return null;
-       }
-       // Re-throw any other unexpected errors
-       throw error;
-     }
-   }
-
+  async logout(userId: string): Promise<void> {
+    // Set the stored hash to null by passing null to the helper
+    await this.updateRefreshTokenHash(userId, null);
+  }
 
   /**
-   * Validates if a user has one of the required roles.
-   * @param userId The ID of the user.
-   * @param requiredRoles An array of role strings required for access.
-   * @returns True if the user has one of the required roles, false otherwise.
+   * Validates a refresh token, issues new tokens (rotation), and updates stored hash.
    */
+  async refreshTokens(userId: string, rt: string): Promise<{ access_token: string, refresh_token: string }> {
+      const user = await this.usersService.findOne(userId); // Fetch user by ID from token payload
+
+      // Check user exists and has a stored token hash
+      if (!user || !user.hashedRefreshToken) {
+          // If no hash stored, user is effectively logged out or never logged in with RT
+          throw new ForbiddenException('Access Denied: No active session found or user logged out.');
+      }
+
+      // Compare the provided RT with the stored hash
+      const rtMatches = await bcrypt.compare(rt, user.hashedRefreshToken);
+      if (!rtMatches) {
+          // SECURITY: If tokens don't match, potentially compromised - clear stored token for safety
+          await this.logout(userId); // Force logout this user session/device
+          throw new ForbiddenException('Access Denied: Refresh token mismatch or invalidated.');
+      }
+
+      // Token is valid - Issue a new pair (Rotation)
+      const newAccessToken = this.generateAccessToken(user);
+      const newRefreshToken = this.generateRefreshToken(user);
+
+      // Update the stored hash with the *new* refresh token's hash
+      await this.updateRefreshTokenHash(user.id, newRefreshToken);
+
+      return {
+          access_token: newAccessToken,
+          refresh_token: newRefreshToken, // Return the new plain refresh token
+      };
+  }
+
+  // --- Validation Helpers (Used by Strategies/Guards) ---
+
+  // validateUser is likely used by JwtStrategy (Access Token)
+  async validateUser(userId: string): Promise<User | null> {
+     try {
+        const user = await this.usersService.findOne(userId);
+        // Optional: Add checks here if user is active/not banned
+        // if (!user.isActive) return null;
+        return user;
+     } catch (error) {
+        if (error instanceof NotFoundException) {
+           return null; // User associated with token doesn't exist anymore
+        }
+        throw error; // Re-throw other errors
+      }
+  }
+
+  // validateUserRoles is used by RolesGuard (checks role from validated user payload)
   async validateUserRoles(userId: string, requiredRoles: string[]): Promise<boolean> {
-    // If no specific roles are required by the route/guard, allow access.
-    if (!requiredRoles || requiredRoles.length === 0) {
-      return true;
-    }
-
-    // Fetch the user details
+    if (!requiredRoles || requiredRoles.length === 0) return true;
     const user = await this.usersService.findOne(userId); // findOne throws if not found
-
-    // If user not found (should have thrown) or doesn't have a role property, deny access
-    // Added explicit check for user existence although findOne should throw.
-    if (!user || !user.role) {
-      return false;
-    }
- 
-    // Check if the user's role string is included in the list of required roles
+    if (!user || !user.role) return false;
     return requiredRoles.includes(user.role);
   }
+
 }
