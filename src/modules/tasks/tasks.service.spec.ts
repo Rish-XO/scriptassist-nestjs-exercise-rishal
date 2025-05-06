@@ -16,6 +16,7 @@ import { TaskStatus } from './enums/task-status.enum';
 import { TaskPriority } from './enums/task-priority.enum';
 import { QueryTaskDto } from './dto/task-filter.dto';
 import { CreateTaskDto } from './dto/create-task.dto';
+import { UpdateTaskDto } from './dto/update-task.dto';
 
 // Define UserPayload or import if defined globally
 interface UserPayload { id: string; email: string; role: string; }
@@ -541,6 +542,219 @@ describe('TasksService', () => {
 
   });
 
+  describe('update', () => {
+    // --- Mock Data ---
+    const taskId = 'task-uuid-for-update';
+    const ownerUser: UserPayload = { id: 'user-uuid-owner', email: 'owner@test.com', role: 'user' };
+    const adminUser: UserPayload = { id: 'user-uuid-admin', email: 'admin@test.com', role: 'admin' };
+    const otherUser: UserPayload = { id: 'user-uuid-other', email: 'other@test.com', role: 'user' };
+
+    const updateDtoWithStatusChange: UpdateTaskDto = { title: 'Updated Title', status: TaskStatus.IN_PROGRESS };
+    const updateDtoWithoutStatusChange: UpdateTaskDto = { description: 'Updated description' };
+
+    // Represents the task fetched initially AND inside TX
+    const existingTask: Task = {
+        id: taskId, title: 'Original Title', description: '', status: TaskStatus.PENDING,
+        priority: TaskPriority.MEDIUM, dueDate: null, userId: ownerUser.id,
+        user: ownerUser as any, createdAt: new Date('2024-01-01T10:00:00Z'),
+        updatedAt: new Date('2024-01-01T10:00:00Z'),
+    };
+
+    // Represents the state returned by entityManager.save inside the transaction
+    const savedTaskState = {
+        ...existingTask,
+        ...updateDtoWithStatusChange, // Apply changes from DTO
+        updatedAt: new Date('2024-01-01T11:00:00Z'), // Simulate updated timestamp
+    };
+
+     // Represents the final result after the re-fetch (includes relations)
+     const finalTaskResult = {
+         ...savedTaskState,
+         user: ownerUser as any, // Ensure relation is present
+     };
+
+    const cacheKey = `task:${taskId}`;
+
+    // --- Mock References ---
+    // Note: We don't need to spy on service.findOne anymore because the version
+    // of update being tested doesn't call it internally.
+    let transactionMock: jest.Mock;
+    let cacheDelMock: jest.Mock;
+    let queueAddMock: jest.Mock;
+    let repoFindOneMock: jest.Mock; // Mock for the final repository findOne
+
+    // --- CORRECTED Mock Transactional Entity Manager ---
+    // It MUST have all methods called within the transaction block
+    const mockTransactionalEntityManager = {
+        findOne: jest.fn(), // <-- ADDED THIS MOCK
+        merge: jest.fn(),
+        save: jest.fn(),
+    };
+    // -------------------------------------------------
+
+    beforeEach(() => {
+        // Reset mocks before each test
+        jest.clearAllMocks();
+
+        // Reset mock references
+        transactionMock = dataSource.transaction as jest.Mock;
+        cacheDelMock = cacheManager.del as jest.Mock;
+        queueAddMock = queue.add as jest.Mock;
+        repoFindOneMock = mockTasksRepository.findOne;
+
+        // Default transaction mock implementation
+        transactionMock.mockImplementation(async (callback) => callback(mockTransactionalEntityManager));
+    });
+
+    // No afterEach needed for spy cleanup anymore
+
+
+    it('should successfully update task for owner, add job, invalidate cache, and return final task', async () => {
+      // Arrange
+      // Mock the findOne call *inside* the transaction
+      mockTransactionalEntityManager.findOne.mockResolvedValueOnce(existingTask);
+      mockTransactionalEntityManager.save.mockResolvedValueOnce(savedTaskState); // Save inside TX succeeds
+      queueAddMock.mockResolvedValueOnce({ id: 'job-update-123' }); // Queue add succeeds
+      cacheDelMock.mockResolvedValueOnce(undefined); // Cache del succeeds
+      repoFindOneMock.mockResolvedValueOnce(finalTaskResult); // Final repo findOne succeeds
+
+      // Act
+      const result = await service.update(taskId, updateDtoWithStatusChange, ownerUser);
+
+      // Assert
+      expect(transactionMock).toHaveBeenCalledTimes(1); // Transaction used
+      expect(mockTransactionalEntityManager.findOne).toHaveBeenCalledWith(Task, { where: { id: taskId }, relations: { user: true } }); // Check findOne inside TX
+      expect(mockTransactionalEntityManager.merge).toHaveBeenCalledWith(Task, existingTask, updateDtoWithStatusChange); // Check merge called
+      expect(mockTransactionalEntityManager.save).toHaveBeenCalledWith(Task, existingTask); // Check save called
+      expect(queueAddMock).toHaveBeenCalledWith('task-status-update', { taskId: savedTaskState.id, status: savedTaskState.status }); // Check queue add
+      expect(cacheDelMock).toHaveBeenCalledWith(cacheKey); // Check cache invalidated
+      expect(repoFindOneMock).toHaveBeenCalledWith({ where: { id: savedTaskState.id }, relations: { user: true } }); // Check final fetch called
+      expect(result).toEqual(finalTaskResult); // Check final result returned
+    });
+
+    it('should update task as admin (no status change), invalidate cache, skip queue', async () => {
+      // Arrange
+      const taskOwnedByOther = { ...existingTask, id: 'other-task-id', userId: otherUser.id, user: otherUser as any };
+      const savedAdminUpdateState = { ...taskOwnedByOther, ...updateDtoWithoutStatusChange };
+      const finalAdminResult = { ...savedAdminUpdateState, user: otherUser as any };
+
+      mockTransactionalEntityManager.findOne.mockResolvedValueOnce(taskOwnedByOther); // findOne inside TX succeeds for admin
+      mockTransactionalEntityManager.save.mockResolvedValueOnce(savedAdminUpdateState);
+      cacheDelMock.mockResolvedValueOnce(undefined);
+      repoFindOneMock.mockResolvedValueOnce(finalAdminResult);
+
+      // Act
+      const result = await service.update('other-task-id', updateDtoWithoutStatusChange, adminUser);
+
+      // Assert
+      expect(transactionMock).toHaveBeenCalledTimes(1);
+      expect(mockTransactionalEntityManager.findOne).toHaveBeenCalledWith(Task, { where: { id: 'other-task-id' }, relations: { user: true } });
+      expect(mockTransactionalEntityManager.merge).toHaveBeenCalledWith(Task, taskOwnedByOther, updateDtoWithoutStatusChange);
+      expect(mockTransactionalEntityManager.save).toHaveBeenCalledWith(Task, taskOwnedByOther);
+      expect(queueAddMock).not.toHaveBeenCalled(); // Queue NOT called
+      expect(cacheDelMock).toHaveBeenCalledWith(`task:other-task-id`);
+      expect(repoFindOneMock).toHaveBeenCalledWith({ where: { id: savedAdminUpdateState.id }, relations: { user: true } });
+      expect(result).toEqual(finalAdminResult);
+    });
+
+
+    it('should throw ForbiddenException if non-owner tries to update', async () => {
+       // Arrange
+       // Mock findOne *inside the transaction* to return the task owned by someone else
+       mockTransactionalEntityManager.findOne.mockResolvedValueOnce(existingTask); // Task owned by ownerUser
+
+       // Act & Assert
+       // The ForbiddenException should be thrown from *within* the transaction callback
+       await expect(service.update(taskId, updateDtoWithStatusChange, otherUser)) // otherUser tries update
+           .rejects.toThrow(ForbiddenException);
+
+       expect(transactionMock).toHaveBeenCalledTimes(1); // Transaction was called
+       expect(mockTransactionalEntityManager.findOne).toHaveBeenCalledTimes(1); // findOne inside TX was called
+       expect(mockTransactionalEntityManager.merge).not.toHaveBeenCalled(); // Merge/Save not called
+       expect(mockTransactionalEntityManager.save).not.toHaveBeenCalled();
+       expect(queueAddMock).not.toHaveBeenCalled();
+       expect(cacheDelMock).not.toHaveBeenCalled(); // Cache not invalidated on failure
+       expect(repoFindOneMock).not.toHaveBeenCalled(); // Final findOne not called
+    });
+
+     it('should throw NotFoundException if task does not exist', async () => {
+       // Arrange
+       // Mock findOne *inside the transaction* to return null
+       mockTransactionalEntityManager.findOne.mockResolvedValueOnce(null);
+
+       // Act & Assert
+       await expect(service.update(taskId, updateDtoWithStatusChange, ownerUser))
+           .rejects.toThrow(NotFoundException);
+
+       expect(transactionMock).toHaveBeenCalledTimes(1);
+       expect(mockTransactionalEntityManager.findOne).toHaveBeenCalledTimes(1);
+       expect(mockTransactionalEntityManager.merge).not.toHaveBeenCalled();
+       expect(mockTransactionalEntityManager.save).not.toHaveBeenCalled();
+       expect(queueAddMock).not.toHaveBeenCalled();
+       expect(cacheDelMock).not.toHaveBeenCalled();
+       expect(repoFindOneMock).not.toHaveBeenCalled();
+     });
+
+     it('should rollback transaction and throw if queue add fails', async () => {
+        // Arrange
+        const queueError = new Error("Queue unavailable");
+        mockTransactionalEntityManager.findOne.mockResolvedValueOnce(existingTask); // findOne inside TX succeeds
+        mockTransactionalEntityManager.save.mockResolvedValueOnce(savedTaskState); // Save inside TX succeeds
+        queueAddMock.mockRejectedValueOnce(queueError); // Queue add fails
+
+        // Act & Assert
+        await expect(service.update(taskId, updateDtoWithStatusChange, ownerUser))
+            .rejects.toThrow(`Failed to queue task update for ${savedTaskState.id}.`); // Expect wrapped error
+
+        expect(transactionMock).toHaveBeenCalledTimes(1);
+        expect(mockTransactionalEntityManager.findOne).toHaveBeenCalledTimes(1);
+        expect(mockTransactionalEntityManager.save).toHaveBeenCalledTimes(1);
+        expect(queueAddMock).toHaveBeenCalledTimes(1); // Queue add was attempted
+        expect(cacheDelMock).not.toHaveBeenCalled(); // Cache should NOT be invalidated
+        expect(repoFindOneMock).not.toHaveBeenCalled(); // Final findOne should NOT be called
+     });
+
+     it('should rollback transaction and throw if db save fails', async () => {
+        // Arrange
+        const dbError = new Error("DB Save Failed");
+        mockTransactionalEntityManager.findOne.mockResolvedValueOnce(existingTask); // findOne inside TX succeeds
+        mockTransactionalEntityManager.save.mockRejectedValueOnce(dbError); // Save inside TX fails
+
+        // Act & Assert
+        await expect(service.update(taskId, updateDtoWithStatusChange, ownerUser))
+            .rejects.toThrow(dbError); // Expect original DB error
+
+        expect(transactionMock).toHaveBeenCalledTimes(1);
+        expect(mockTransactionalEntityManager.findOne).toHaveBeenCalledTimes(1);
+        expect(mockTransactionalEntityManager.save).toHaveBeenCalledTimes(1); // Save was attempted
+        expect(queueAddMock).not.toHaveBeenCalled(); // Queue add NOT attempted
+        expect(cacheDelMock).not.toHaveBeenCalled();
+        expect(repoFindOneMock).not.toHaveBeenCalled();
+     });
+
+    it('should complete update and invalidate cache even if cache deletion fails', async () => {
+       // Arrange
+       mockTransactionalEntityManager.findOne.mockResolvedValueOnce(existingTask);
+       mockTransactionalEntityManager.save.mockResolvedValueOnce(savedTaskState);
+       queueAddMock.mockResolvedValueOnce({ id: 'job-abc' });
+       cacheDelMock.mockRejectedValueOnce(new Error("Cache DEL failed")); // Cache invalidation fails
+       repoFindOneMock.mockResolvedValueOnce(finalTaskResult); // Final findOne still succeeds
+
+       // Act
+       const result = await service.update(taskId, updateDtoWithStatusChange, ownerUser);
+
+       // Assert
+       expect(result).toEqual(finalTaskResult); // Update still returns successfully
+       expect(transactionMock).toHaveBeenCalledTimes(1);
+       expect(mockTransactionalEntityManager.findOne).toHaveBeenCalledTimes(1);
+       expect(mockTransactionalEntityManager.save).toHaveBeenCalledTimes(1);
+       expect(queueAddMock).toHaveBeenCalledTimes(1);
+       expect(cacheDelMock).toHaveBeenCalledWith(cacheKey); // Invalidation was attempted
+       expect(repoFindOneMock).toHaveBeenCalledTimes(1); // Final fetch was called
+       // We expect logger.error for cache failure
+    });
+
+});
   // --- Add describe blocks for other methods (create, findAllPaginated, update, remove, getStats, etc.) ---
 
 
