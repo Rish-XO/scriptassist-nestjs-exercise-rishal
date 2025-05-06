@@ -89,38 +89,29 @@ export class TaskProcessorService extends WorkerHost {
     const { taskId, userId } = job.data;
     this.logger.debug(`[Job ${job.id}] Handling overdue notification for task ${taskId}, user ${userId}`);
 
-    // Validate required data
     if (!taskId || !userId) {
-      this.logger.error(`[Job ${job.id}] ('overdue-task-notification') missing required data.`);
-      // Throw error for non-retryable failure
-      throw new Error('Missing required data (taskId or userId)');
+        this.logger.error(`[Job ${job.id}] ('overdue-task-notification') missing required data.`);
+        throw new Error('Missing required data (taskId or userId)'); // Fail non-retryable
     }
 
-    // --- Implement Actual Logic Here ---
-    // This section depends heavily on application requirements.
-    // Example: Log, send notification via another service, update task status further.
-
     try {
-      // Example Action 1: Log notification intent
-      this.logger.log(`[Job ${job.id}] TODO: Trigger notification for overdue task ${taskId} to user ${userId}.`);
+        // --- Placeholder Logic: ---
+        // Fetching data would go here if needed for the notification content
+        // const task = await this.tasksService.findOne(taskId, ???); // Problem: Need user context or system context for findOne
+        // const user = await this.usersService.findOne(userId);
 
-      // Example Action 2: Update task status to 'OVERDUE' (if enum exists)
-      // Requires TaskStatus enum to have an 'OVERDUE' value
-      // try {
-      //    await this.tasksService.updateStatus(taskId, TaskStatus.OVERDUE); // Assuming OVERDUE status exists
-      //    this.logger.log(`[Job ${job.id}] Updated task ${taskId} status to OVERDUE.`);
-      // } catch (error) {
-      //   if (error instanceof NotFoundException) {
-      //      this.logger.warn(`[Job ${job.id}] Task ${taskId} not found during overdue status update attempt.`);
-           // Decide if this is a critical failure or just a warning
-      //   } else {
-      //      throw error; // Re-throw other errors for retry
-      //   }
-      // }
+        // Log the action instead of sending a real notification
+        this.logger.log(`[Job ${job.id}] Notification simulated for overdue task ${taskId} for user ${userId}.`);
 
-      // --- End Placeholder Logic ---
+        // --- Optionally update status ---
+        // If TaskStatus.OVERDUE exists:
+        // try {
+        //    await this.tasksService.updateStatus(taskId, TaskStatus.OVERDUE);
+        //    this.logger.log(`[Job ${job.id}] Updated task ${taskId} status to OVERDUE.`);
+        // } catch (error) { ... handle not found etc ... }
+        // -----------------------------
 
-      return { success: true, message: `Overdue notification processed for task ${taskId}` };
+        return { success: true, message: `Overdue notification processed for task ${taskId}` };
 
     } catch (error) {
       let errorMessage = 'An unknown error occurred while processing overdue task';
