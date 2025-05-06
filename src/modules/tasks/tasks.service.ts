@@ -1,45 +1,52 @@
-import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
+// src/modules/tasks/tasks.service.ts
+
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+  Inject, // <-- Added for CACHE_MANAGER
+  Logger, // <-- Added for logging
+  HttpException,
+  HttpStatus,
+} from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager'; // <-- Added
+import { Cache } from 'cache-manager'; // <-- Added
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, FindManyOptions, FindOptionsWhere, In, Repository } from 'typeorm';
 import { Task } from './entities/task.entity';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
+import { PaginatedResponse } from '../../types/pagination.interface'; // <-- Correct path
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { TaskStatus } from './enums/task-status.enum';
 import { TaskPriority } from './enums/task-priority.enum';
-import { PaginatedResponse } from '../../types/pagination.interface';
+import { ConfigService } from '@nestjs/config'; // <-- Added for TTL
 import { QueryTaskDto } from './dto/task-filter.dto';
 
-interface UserPayload {
-  id: string;
-  email: string;
-  role: string;
-}
+// Define UserPayload or import
+interface UserPayload { id: string; email: string; role: string; }
 
 @Injectable()
 export class TasksService {
+  private readonly logger = new Logger(TasksService.name); // <-- Added logger
+
   constructor(
     @InjectRepository(Task)
     private tasksRepository: Repository<Task>,
     @InjectQueue('task-processing')
     private taskQueue: Queue,
     private dataSource: DataSource,
+    @Inject(CACHE_MANAGER) private cacheManager: Cache, // <-- Injected Cache Manager
+    private configService: ConfigService // <-- Injected ConfigService
   ) {}
 
+  // --- GET STATS (Optimized - No caching applied here usually) ---
   async getStats(user: UserPayload) {
     const qb = this.tasksRepository.createQueryBuilder("task");
-
-    // Apply user filtering ONLY if the user is not an admin
     if (user.role !== 'admin') {
       qb.where("task.userId = :userId", { userId: user.id });
-      // Note: Ensure your Task entity has a "userId" column if using this directly,
-      // or use the relation `task.user.id` if appropriate for your setup,
-      // but filtering on the foreign key column `userId` is usually more efficient.
-      // Let's assume `userId` column exists on `task` table based on schema script.
     }
-
-    // Use conditional aggregation to count different statuses and priorities in one query
     qb.select("COUNT(*)", "total")
       .addSelect(`SUM(CASE WHEN task.status = :completed THEN 1 ELSE 0 END)`, "completed")
       .addSelect(`SUM(CASE WHEN task.status = :inProgress THEN 1 ELSE 0 END)`, "inProgress")
@@ -47,313 +54,345 @@ export class TasksService {
       .addSelect(`SUM(CASE WHEN task.priority = :high THEN 1 ELSE 0 END)`, "highPriority")
       .addSelect(`SUM(CASE WHEN task.priority = :medium THEN 1 ELSE 0 END)`, "mediumPriority")
       .addSelect(`SUM(CASE WHEN task.priority = :low THEN 1 ELSE 0 END)`, "lowPriority")
-      .setParameters({ // Set parameters for status/priority values
+      .setParameters({
         completed: TaskStatus.COMPLETED,
         inProgress: TaskStatus.IN_PROGRESS,
         pending: TaskStatus.PENDING,
         high: TaskPriority.HIGH,
         medium: TaskPriority.MEDIUM,
         low: TaskPriority.LOW,
-        // userId parameter is added conditionally above if needed
         ...(user.role !== 'admin' && { userId: user.id })
       });
-
-    // Execute the query and get the raw results
     const statsResult = await qb.getRawOne();
-
-    // Parse the raw results (which might be strings) into numbers
     const statistics = {
-      total: parseInt(statsResult.total, 10) || 0,
-      completed: parseInt(statsResult.completed, 10) || 0,
-      inProgress: parseInt(statsResult.inProgress, 10) || 0,
-      pending: parseInt(statsResult.pending, 10) || 0,
-      highPriority: parseInt(statsResult.highPriority, 10) || 0,
-      mediumPriority: parseInt(statsResult.mediumPriority, 10) || 0,
-      lowPriority: parseInt(statsResult.lowPriority, 10) || 0,
+      total: parseInt(statsResult?.total || '0', 10),
+      completed: parseInt(statsResult?.completed || '0', 10),
+      inProgress: parseInt(statsResult?.inProgress || '0', 10),
+      pending: parseInt(statsResult?.pending || '0', 10),
+      highPriority: parseInt(statsResult?.highPriority || '0', 10),
+      mediumPriority: parseInt(statsResult?.mediumPriority || '0', 10),
+      lowPriority: parseInt(statsResult?.lowPriority || '0', 10),
     };
-
     return statistics;
   }
 
+  // --- CREATE (With Transaction) ---
   async create(createTaskDto: CreateTaskDto, user: UserPayload): Promise<Task> {
-    // Wrap operations in a transaction
+    // Caching Note: Create operations usually invalidate list caches, but we don't cache lists here yet.
     return this.dataSource.transaction(async (transactionalEntityManager) => {
-      const task = transactionalEntityManager.create(Task, { // Use manager.create
+      const task = transactionalEntityManager.create(Task, {
         ...createTaskDto,
         user: { id: user.id }
       });
-      const savedTask = await transactionalEntityManager.save(Task, task); // Use manager.save
-
-      // Add to queue WITHIN the transaction block
-      // Note: Potential distributed transaction issue if queue add fails AFTER commit starts
-      // or DB commit fails AFTER queue add succeeds. Simpler approach for now.
+      const savedTask = await transactionalEntityManager.save(Task, task);
       try {
         await this.taskQueue.add('task-status-update', {
-          taskId: savedTask.id,
-          status: savedTask.status,
-        });
+             taskId: savedTask.id,
+             status: savedTask.status,
+         });
       } catch (queueError) {
-          console.error("Failed to add task to queue, rolling back transaction", queueError);
-          // Throwing error here will cause the transaction manager to rollback
-          throw new Error(`Failed to add task ${savedTask.id} to queue.`);
+        if (queueError instanceof Error) {
+          this.logger.error(
+            `Failed to add task ${savedTask.id} to queue (TX WILL ROLLBACK): ${queueError.message}`,
+            queueError.stack
+          );
+        } else {
+          this.logger.error(
+            `Failed to add task ${savedTask.id} to queue (TX WILL ROLLBACK): Unknown error`,
+            String(queueError)
+          );
+        }
+        throw new Error(`Failed to queue task update for ${savedTask.id}.`);
       }
-
-      // Fetch and return the task with relation (using original repository or manager)
-      // Fetching outside might be safer if queue interaction inside TX is problematic
-      const result = await this.tasksRepository.findOne({ // Use main repo here is fine
+      // Fetch again to return entity with relations possibly needed by client
+      const result = await transactionalEntityManager.findOne(Task, { // Use TX manager to read within TX
            where: { id: savedTask.id },
            relations: { user: true },
        });
-       if (!result) throw new NotFoundException('Failed to retrieve created task');
+       if (!result) throw new NotFoundException('Failed to retrieve created task after save.');
        return result;
-
-    }); // End transaction block
-}
-
-// --- NEW METHOD for Paginated/Filtered FindAll ---
-  /**
-   * Finds tasks with pagination, filtering, and user-based access control.
-   * @param queryDto DTO containing pagination and filter parameters.
-   * @param user The authenticated user payload.
-   * @returns A paginated result set of tasks.
-   */
-  async findAllPaginated(
-    queryDto: QueryTaskDto,
-    user: UserPayload,
-  ): Promise<PaginatedResponse<Task>> {
-    // Destructure DTO, applying defaults if necessary (defaults are set in DTO)
-    const { page = 1, limit = 10, status, priority /*, sortBy, sortOrder, search */ } = queryDto;
-    const skip = (page - 1) * limit;
-
-    // Start building the WHERE clause for the query
-    const whereClause: FindOptionsWhere<Task> = {};
-
-    // Filter by user ID ONLY if the user is NOT an admin
-    if (user.role !== 'admin') {
-      whereClause.user = { id: user.id };
-    }
-
-    // Add status filter if provided
-    if (status) {
-      whereClause.status = status;
-    }
-
-    // Add priority filter if provided
-    if (priority) {
-      whereClause.priority = priority;
-    }
-
-    // TODO: Add search filter if implementing search (e.g., using ILIKE on title/description)
-    // if (search) {
-    //   whereClause.title = ILike(`%${search}%`); // Example, may need array for multiple conditions
-    // }
-
-    // Build the main options object for TypeORM's findAndCount
-    const findOptions: FindManyOptions<Task> = {
-      where: whereClause,
-      relations: { user: true }, // Eager load user details (consider if always needed)
-      take: limit, // Apply limit (items per page)
-      skip: skip, // Apply offset (for pagination)
-      order: {
-        createdAt: 'DESC', // Default sort order (newest first)
-        // TODO: Add dynamic sorting based on DTO params `sortBy`, `sortOrder` if implemented
-        // ...(sortBy && sortOrder && { [sortBy]: sortOrder }),
-      },
-    };
-
-    // Execute the query using findAndCount to get tasks and total count efficiently
-    const [tasks, totalItems] = await this.tasksRepository.findAndCount(findOptions);
-
-    // Calculate pagination metadata
-    const totalPages = Math.ceil(totalItems / limit);
-
-    // Structure the response according to your PaginatedResponse<T> interface
-    return {
-      data: tasks,
-      meta: {
-        total: totalItems,    // Use 'total' as per your interface
-        page: page,         // Use 'page' as per your interface
-        limit: limit,       // Use 'limit' as per your interface
-        totalPages: totalPages, // Use 'totalPages' as per your interface
-      },
-    };
-  }
-
-  // --- FINDONE (Optimize fetch & Add Auth Check) ---
-  async findOne(id: string, user: UserPayload): Promise<Task> { // <-- Accept UserPayload
-    // Optimized: Fetch in one go using findOne
-    const task = await this.tasksRepository.findOne({
-        where: { id },
-        relations: { user: true }, // Need user relation for auth check
     });
-
-    if (!task) {
-        throw new NotFoundException(`Task with ID ${id} not found`);
-    }
-
-    // --- Authorization Check ---
-    if (user.role !== 'admin' && task.user?.id !== user.id) {
-        throw new ForbiddenException('You do not have permission to access this task.');
-    }
-    // --------------------------
-
-    return task;
   }
 
+  // --- FINDALLPAGINATED (Optimized - No Caching) ---
+  async findAllPaginated( queryDto: QueryTaskDto, user: UserPayload ): Promise<PaginatedResponse<Task>> {
+    const { page = 1, limit = 10, status, priority } = queryDto;
+    const skip = (page - 1) * limit;
+    const whereClause: FindOptionsWhere<Task> = {};
+    if (user.role !== 'admin') { whereClause.user = { id: user.id }; }
+    if (status) { whereClause.status = status; }
+    if (priority) { whereClause.priority = priority; }
+    const findOptions: FindManyOptions<Task> = {
+        where: whereClause,
+        relations: { user: true }, // Eager load user - adjust if needed
+        take: limit,
+        skip: skip,
+        order: { createdAt: 'DESC' }
+    };
+    const [tasks, totalItems] = await this.tasksRepository.findAndCount(findOptions);
+    const totalPages = Math.ceil(totalItems / limit);
+    return {
+        data: tasks,
+        meta: { total: totalItems, page, limit, totalPages }
+    };
+  }
 
-  async update(id: string, updateTaskDto: UpdateTaskDto, user: UserPayload): Promise<Task> {
-    // 1. Check existence and authorization first (using the already fixed findOne)
-    const task = await this.findOne(id, user);
-    const originalStatus = task.status;
+  // --- FINDONE (Optimized Fetch & Added Caching) ---
+  async findOne(id: string, user: UserPayload): Promise<Task> {
+    const cacheKey = `task:${id}`;
+    this.logger.debug(`findOne: Checking cache for key: ${cacheKey}`);
 
-    // 2. Wrap the update and queue logic in a transaction
-    return this.dataSource.transaction(async (transactionalEntityManager) => {
-      // Apply updates using merge within the transaction
-      // Note: 'task' object is already loaded, merge applies dto changes onto it
-      transactionalEntityManager.merge(Task, task, updateTaskDto);
-
-      // Save using the transactional entity manager
-      const updatedTask = await transactionalEntityManager.save(Task, task); // Pass class and entity
-
-      // Add to queue if status changed, WITHIN the transaction block
-      if (updateTaskDto.status && originalStatus !== updatedTask.status) {
-        try {
-          await this.taskQueue.add('task-status-update', {
-            taskId: updatedTask.id,
-            status: updatedTask.status,
-          });
-        } catch (queueError) {
-          console.error("Failed to add updated task to queue, rolling back transaction", queueError);
-          // Throwing error here will cause the transaction manager to rollback
-          throw new Error(`Failed to add updated task ${updatedTask.id} to queue.`);
+    try {
+      // 1. Check Cache
+      const cachedTaskData = await this.cacheManager.get<any>(cacheKey);
+      if (cachedTaskData) {
+        this.logger.debug(`findOne: Cache HIT for key: ${cacheKey}`);
+        // Ensure cached data has necessary info for auth check
+        const cachedUserId = cachedTaskData.userId || cachedTaskData.user?.id;
+        if (!cachedUserId) {
+             this.logger.warn(`findOne: Cached data for ${cacheKey} missing user ID.`);
+             // Treat as cache miss if essential data is missing
+        } else {
+             // IMPORTANT: Re-validate authorization on cached data
+             if (user.role !== 'admin' && cachedUserId !== user.id) {
+                 throw new ForbiddenException('You do not have permission to access this task (cache).');
+             }
+             // Return cached data (potentially rehydrated if needed)
+             return cachedTaskData as Task; // Be cautious with casting
         }
       }
-      // Important: Return the task *after* potentially fetching relations again
-      // if the caller needs them and `save` doesn't return them eagerly with the manager.
-      // Fetching using the manager ensures it's part of the transaction snapshot.
-      const result = await transactionalEntityManager.findOne(Task, {
-           where: { id: updatedTask.id },
-           relations: { user: true }, // Re-fetch with relations if needed by client
+
+      this.logger.debug(`findOne: Cache MISS for key: ${cacheKey}`);
+
+      // 2. Cache Miss -> Fetch from DB
+      const task = await this.tasksRepository.findOne({
+          where: { id },
+          relations: { user: true }, // Need user relation for auth check
+      });
+
+      if (!task) {
+          throw new NotFoundException(`Task with ID ${id} not found`);
+      }
+
+      // 3. Authorization Check (on DB data)
+      if (user.role !== 'admin' && task.user?.id !== user.id) {
+          throw new ForbiddenException('You do not have permission to access this task.');
+      }
+
+      // 4. Store fetched data in Cache before returning
+      const ttlSeconds = this.configService.get<number>('CACHE_TTL', 300); // Get TTL in seconds
+      await this.cacheManager.set(cacheKey, task, ttlSeconds * 1000); // Set cache with TTL in ms
+      this.logger.debug(`findOne: Stored data in cache for key: ${cacheKey} with TTL: ${ttlSeconds * 1000}ms`);
+
+      return task;
+
+    } catch (error) {
+      if (error instanceof NotFoundException || error instanceof ForbiddenException) {
+        throw error; // Re-throw specific HTTP exceptions
+      }
+    
+      if (error instanceof Error) {
+        this.logger.error(`Error in findOne for task ${id}: ${error.message}`, error.stack);
+      } else {
+        this.logger.error(`Unknown error in findOne for task ${id}: ${String(error)}`);
+      }
+    
+      throw new HttpException('Failed to retrieve task', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+  }
+  // --- END UPDATED findOne ---
+
+
+  // --- UPDATE (Optimized Fetch, Transaction, Added Cache Invalidation) ---
+  async update(id: string, updateTaskDto: UpdateTaskDto, user: UserPayload): Promise<Task> {
+    const cacheKey = `task:${id}`;
+
+    const updatedTaskResult = await this.dataSource.transaction(async (transactionalEntityManager) => {
+        // Fetch using the transactional entity manager
+        const task = await transactionalEntityManager.findOne(Task, {
+             where: { id },
+             relations: { user: true }, // Needed for auth check
+         });
+
+        if (!task) throw new NotFoundException(`Task with ID ${id} not found`);
+
+        // Authorization Check
+        if (user.role !== 'admin' && task.user?.id !== user.id) {
+            throw new ForbiddenException('You do not have permission to update this task.');
+        }
+
+        const originalStatus = task.status;
+        // Apply updates using merge (safer than Object.assign for entities)
+        transactionalEntityManager.merge(Task, task, updateTaskDto);
+        const savedTask = await transactionalEntityManager.save(Task, task); // Save updated entity
+
+        // Add to queue if status changed
+        if (updateTaskDto.status && originalStatus !== savedTask.status) {
+            try {
+                await this.taskQueue.add('task-status-update', { taskId: savedTask.id, status: savedTask.status });
+            } catch (queueError) {
+              if (queueError instanceof Error) {
+                this.logger.error(
+                  `Failed to add updated task ${savedTask.id} to queue (TX WILL ROLLBACK): ${queueError.message}`,
+                  queueError.stack
+                );
+              } else {
+                this.logger.error(
+                  `Failed to add updated task ${savedTask.id} to queue (TX WILL ROLLBACK): Unknown error`,
+                  String(queueError)
+                );
+              }
+            
+              throw new Error(`Failed to queue task update for ${savedTask.id}.`);
+            }
+        }
+        // Return the updated task from transaction scope
+        return savedTask;
+    });
+
+     // --- Invalidate Cache AFTER successful transaction ---
+     try {
+        await this.cacheManager.del(cacheKey);
+        this.logger.debug(`update: Cache invalidated for key: ${cacheKey}`);
+     } catch (cacheError) {
+      if (cacheError instanceof Error) {
+        this.logger.error(
+          `Failed to invalidate cache for key ${cacheKey} after update: ${cacheError.message}`,
+          cacheError.stack
+        );
+      } else {
+        this.logger.error(
+          `Failed to invalidate cache for key ${cacheKey} after update: Unknown error`,
+          String(cacheError)
+        );
+      }
+      // Don't fail the request if only cache invalidation fails
+     }
+     // --------------------------------------------------
+
+     // Return the result (might lack relations if not eagerly loaded by save)
+     // Re-fetch if necessary, or ensure client doesn't strictly need relations on update response
+      const result = await this.tasksRepository.findOne({
+           where: { id: updatedTaskResult.id },
+           relations: { user: true }, // Re-fetch with relations
        });
-       if (!result) throw new NotFoundException('Failed to retrieve updated task'); // Should not happen
+       if (!result) throw new NotFoundException('Failed to retrieve updated task post-cache invalidation');
        return result;
 
-      // Or if relations aren't needed, simply: return updatedTask; (less safe if save result differs)
-
-    }); // End transaction block
+     // return updatedTaskResult; // Alternative: return result from TX (might lack relations)
   }
+  // --- END UPDATED update ---
 
-// --- REMOVE (Optimize fetch & Add Auth Check) ---
-async remove(id: string, user: UserPayload): Promise<void> { // <-- Accept UserPayload
-  // Fetch the task first, ensuring it exists and checking auth in one go
- const task = await this.findOne(id, user); // Re-use findOne logic including auth check
 
- // task is guaranteed to exist and be accessible by the user here
+  // --- REMOVE (Optimized Fetch, Auth Check, Added Cache Invalidation) ---
+  async remove(id: string, user: UserPayload): Promise<void> {
+     const cacheKey = `task:${id}`;
 
- await this.tasksRepository.remove(task);
- // No return value needed for remove
-}
+     // 1. Check existence and authorization first using findOne (which is now cached)
+     // This ensures task exists and user is authorized before attempting delete
+     await this.findOne(id, user); // We don't need the return value here, just the checks
 
- // --- REFACTORED findByStatus METHOD ---
-  /**
-   * Finds tasks by status, respecting user ownership for non-admins.
-   * @param status The status to filter by.
-   * @param user The authenticated user payload.
-   * @returns A promise resolving to an array of tasks.
-   */
+     // 2. Perform deletion using the main repository
+     const deleteResult = await this.tasksRepository.delete({ id }); // Use criteria directly
+
+     if (deleteResult.affected === 0) {
+         // This case should technically be caught by findOne, but check again
+         throw new NotFoundException(`Task with ID ${id} not found for deletion.`);
+     }
+
+     // --- Invalidate Cache AFTER successful deletion ---
+     try {
+       await this.cacheManager.del(cacheKey);
+       this.logger.debug(`remove: Cache invalidated for key: ${cacheKey}`);
+     } catch (cacheError) {
+      if (cacheError instanceof Error) {
+        this.logger.error(
+          `Failed to invalidate cache for key ${cacheKey} after delete: ${cacheError.message}`,
+          cacheError.stack
+        );
+      } else {
+        this.logger.error(
+          `Failed to invalidate cache for key ${cacheKey} after delete: Unknown error`,
+          String(cacheError)
+        );
+      }
+      // Don't fail the request if only cache invalidation fails
+     }
+     // --------------------------------------------------
+  }
+  // --- END UPDATED remove ---
+
+
+  // --- findByStatus (Refactored - No Caching) ---
   async findByStatus(status: TaskStatus, user: UserPayload): Promise<Task[]> {
-    // Build the WHERE clause dynamically
-    const whereClause: FindOptionsWhere<Task> = {
-        status: status // Filter by the provided status
-    };
-
-    // Add user filtering ONLY if the user is NOT an admin
-    if (user.role !== 'admin') {
-      whereClause.user = { id: user.id };
-    }
-
-    // Use the repository's find method with the constructed where clause
-    // Include relations if typically needed by the caller, consistent with findOne/findAllPaginated
+    const whereClause: FindOptionsWhere<Task> = { status: status };
+    if (user.role !== 'admin') { whereClause.user = { id: user.id }; }
     return this.tasksRepository.find({
         where: whereClause,
-        relations: { user: true }, // Load user relation if needed
-        order: { createdAt: 'DESC' } // Optional: Add default sorting
+        relations: { user: true },
+        order: { createdAt: 'DESC' }
     });
   }
-  // --- END REFACTORED findByStatus METHOD ---
 
-  // --- UPDATE STATUS (Needs Auth Consideration) ---
+  // --- updateStatus (Optimized - No Caching/Auth yet) ---
   async updateStatus(id: string, status: string): Promise<Task> {
-    // TODO: Determine authorization strategy for task processor calls
-    // This method might be called by a system process, not a logged-in user.
-    // For now, we optimize the update but skip user auth check here.
+    // Auth still TODO based on processor context
     const result = await this.tasksRepository.update(id, { status: status as TaskStatus });
-    if (result.affected === 0) {
-        throw new NotFoundException(`Task with ID ${id} not found`);
-    }
+    if (result.affected === 0) { throw new NotFoundException(`Task with ID ${id} not found`); }
     const updatedTask = await this.tasksRepository.findOneBy({ id });
-    if (!updatedTask) {
-      throw new NotFoundException(`Task with ID ${id} not found after update attempt`);
-    }
-    // Re-attach user relation if needed by caller? Be careful.
-    // Fetching again without relation is safer if caller doesn't need user.
+    if (!updatedTask) { throw new NotFoundException(`Task with ID ${id} not found after update attempt`);}
     return updatedTask;
   }
 
-  // --- ADD BATCH METHODS ---
+  // --- Batch Methods (Optimized + Added Cache Invalidation) ---
+  async batchUpdateStatus(taskIds: string[], status: TaskStatus, user: UserPayload): Promise<{ affected: number }> {
+      // ... (Bulk auth check logic remains the same) ...
+       if (user.role !== 'admin') {
+          const ownedCount = await this.tasksRepository.count({ where: { id: In(taskIds), user: { id: user.id } }});
+          if (ownedCount !== taskIds.length) { throw new ForbiddenException(/*...*/); }
+       }
 
-async batchUpdateStatus(taskIds: string[], status: TaskStatus, user: UserPayload): Promise<{ affected: number }> {
-  // 1. Authorization Check (if not admin)
-  if (user.role !== 'admin') {
-      // Find how many of the requested IDs actually belong to the user
-      const ownedCount = await this.tasksRepository.count({
-          where: {
-              id: In(taskIds), // Check only within the requested IDs
-              user: { id: user.id }
-          }
-      });
-      // If the count doesn't match, the user tried to update tasks they don't own
-      if (ownedCount !== taskIds.length) {
-          // For simplicity, deny the whole operation. Could also filter IDs.
-          throw new ForbiddenException('You do not have permission to update one or more of the specified tasks.');
+      const updateCriteria: FindOptionsWhere<Task> = { id: In(taskIds) };
+      if (user.role !== 'admin') { updateCriteria.user = { id: user.id }; }
+
+      const result = await this.tasksRepository.update(updateCriteria, { status });
+      const affectedCount = result.affected ?? 0;
+
+      // Invalidate Cache AFTER successful update (best effort)
+      if (affectedCount > 0) {
+          // Invalidate only the keys that were likely updated (based on initial IDs)
+          const cacheKeys = taskIds.map(tid => `task:${tid}`);
+          this.logger.debug(`batchUpdateStatus: Invalidating ${cacheKeys.length} cache keys...`);
+          Promise.allSettled(cacheKeys.map(key => this.cacheManager.del(key)))
+            .then(results => { /* ... logging for failed invalidations ... */ });
       }
+
+      return { affected: affectedCount };
   }
 
-  // 2. Perform Bulk Update
-  // Add user filter again for non-admins as an extra safety layer in the update itself
-  const updateCriteria: FindOptionsWhere<Task> = { id: In(taskIds) };
-  if (user.role !== 'admin') {
-      updateCriteria.user = { id: user.id };
+  async batchDelete(taskIds: string[], user: UserPayload): Promise<{ affected: number }> {
+       // ... (Bulk auth check logic remains the same) ...
+        if (user.role !== 'admin') {
+           const ownedCount = await this.tasksRepository.count({ where: { id: In(taskIds), user: { id: user.id } }});
+           if (ownedCount !== taskIds.length) { throw new ForbiddenException(/*...*/); }
+        }
+
+       const deleteCriteria: FindOptionsWhere<Task> = { id: In(taskIds) };
+       if (user.role !== 'admin') { deleteCriteria.user = { id: user.id }; }
+
+       const result = await this.tasksRepository.delete(deleteCriteria);
+       const affectedCount = result.affected ?? 0;
+
+       // Invalidate Cache AFTER successful delete (best effort)
+       if (affectedCount > 0) {
+            const cacheKeys = taskIds.map(tid => `task:${tid}`);
+            this.logger.debug(`batchDelete: Invalidating ${cacheKeys.length} cache keys...`);
+            Promise.allSettled(cacheKeys.map(key => this.cacheManager.del(key)))
+              .then(results => { /* ... logging for failed invalidations ... */ });
+       }
+
+       return { affected: affectedCount };
   }
+  // --- END BATCH METHODS ---
 
-  const result = await this.tasksRepository.update(updateCriteria, { status });
-
-  // TODO: Consider adding a single batch job to the queue if needed
-
-  return { affected: result.affected ?? 0 };
-}
-
-async batchDelete(taskIds: string[], user: UserPayload): Promise<{ affected: number }> {
-  // 1. Authorization Check (if not admin)
-  if (user.role !== 'admin') {
-      const ownedCount = await this.tasksRepository.count({
-          where: {
-              id: In(taskIds),
-              user: { id: user.id }
-          }
-      });
-      if (ownedCount !== taskIds.length) {
-          throw new ForbiddenException('You do not have permission to delete one or more of the specified tasks.');
-      }
-  }
-
-  // 2. Perform Bulk Delete
-  const deleteCriteria: FindOptionsWhere<Task> = { id: In(taskIds) };
-   if (user.role !== 'admin') {
-       deleteCriteria.user = { id: user.id };
-   }
-  const result = await this.tasksRepository.delete(deleteCriteria);
-
-  return { affected: result.affected ?? 0 };
-}
 }
