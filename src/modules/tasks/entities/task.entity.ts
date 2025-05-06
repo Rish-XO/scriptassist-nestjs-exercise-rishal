@@ -36,9 +36,13 @@ export class Task {
   })
   priority: TaskPriority;
 
-  @Index() // <-- Add index for overdue task lookup
-  @Column({ name: 'due_date', nullable: true })
-  dueDate: Date | null; 
+  @Index()
+  @Column({
+    name: 'due_date',
+    nullable: true,
+    type: 'timestamp', // <-- Explicitly set the database column type
+  })
+  dueDate: Date | null; // Keep TypeScript type as Date | null
 
   @Index() // <-- CRITICAL: Add index for filtering/joining by user
   @Column({ name: 'user_id' })

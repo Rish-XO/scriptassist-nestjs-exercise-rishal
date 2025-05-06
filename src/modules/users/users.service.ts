@@ -53,4 +53,9 @@ export class UsersService {
     const user = await this.findOne(id);
     await this.usersRepository.remove(user);
   }
+
+  async updateRefreshToken(userId: string, hashedRefreshToken: string | null): Promise<void> {
+    // Use update directly for efficiency
+    await this.usersRepository.update({ id: userId }, { hashedRefreshToken });
+  }
 } 
