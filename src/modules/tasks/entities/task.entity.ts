@@ -38,7 +38,7 @@ export class Task {
 
   @Index() // <-- Add index for overdue task lookup
   @Column({ name: 'due_date', nullable: true })
-  dueDate: Date;
+  dueDate: Date | null; 
 
   @Index() // <-- CRITICAL: Add index for filtering/joining by user
   @Column({ name: 'user_id' })

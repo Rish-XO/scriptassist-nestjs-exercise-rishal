@@ -9,8 +9,8 @@ import {
   HttpException,
   HttpStatus,
 } from '@nestjs/common';
-import { CACHE_MANAGER } from '@nestjs/cache-manager'; // <-- Added
-import { Cache } from 'cache-manager'; // <-- Added
+import { CACHE_MANAGER , Cache} from '@nestjs/cache-manager'; // <-- Added
+// import { Cache } from 'cache-manager'; // <-- Added
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, FindManyOptions, FindOptionsWhere, In, Repository } from 'typeorm';
 import { Task } from './entities/task.entity';
