@@ -1,6 +1,6 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { FindManyOptions, FindOptionsWhere, Repository } from 'typeorm';
+import { DataSource, FindManyOptions, FindOptionsWhere, In, Repository } from 'typeorm';
 import { Task } from './entities/task.entity';
 import { CreateTaskDto } from './dto/create-task.dto';
 import { UpdateTaskDto } from './dto/update-task.dto';
@@ -24,60 +24,91 @@ export class TasksService {
     private tasksRepository: Repository<Task>,
     @InjectQueue('task-processing')
     private taskQueue: Queue,
+    private dataSource: DataSource,
   ) {}
 
   async getStats(user: UserPayload) {
-    // Define query options based on user role
-    const findOptions: FindManyOptions<Task> = {};
+    const qb = this.tasksRepository.createQueryBuilder("task");
+
+    // Apply user filtering ONLY if the user is not an admin
     if (user.role !== 'admin') {
-      // Non-admin users only see their own tasks
-      findOptions.where = { user: { id: user.id } }; // Filter by user ID relationship
+      qb.where("task.userId = :userId", { userId: user.id });
+      // Note: Ensure your Task entity has a "userId" column if using this directly,
+      // or use the relation `task.user.id` if appropriate for your setup,
+      // but filtering on the foreign key column `userId` is usually more efficient.
+      // Let's assume `userId` column exists on `task` table based on schema script.
     }
-    // For admins, findOptions remains empty (fetches all tasks)
 
-    // Inefficient approach (fetch all relevant tasks first) - WILL BE OPTIMIZED LATER
-    const tasks = await this.tasksRepository.find(findOptions);
+    // Use conditional aggregation to count different statuses and priorities in one query
+    qb.select("COUNT(*)", "total")
+      .addSelect(`SUM(CASE WHEN task.status = :completed THEN 1 ELSE 0 END)`, "completed")
+      .addSelect(`SUM(CASE WHEN task.status = :inProgress THEN 1 ELSE 0 END)`, "inProgress")
+      .addSelect(`SUM(CASE WHEN task.status = :pending THEN 1 ELSE 0 END)`, "pending")
+      .addSelect(`SUM(CASE WHEN task.priority = :high THEN 1 ELSE 0 END)`, "highPriority")
+      .addSelect(`SUM(CASE WHEN task.priority = :medium THEN 1 ELSE 0 END)`, "mediumPriority")
+      .addSelect(`SUM(CASE WHEN task.priority = :low THEN 1 ELSE 0 END)`, "lowPriority")
+      .setParameters({ // Set parameters for status/priority values
+        completed: TaskStatus.COMPLETED,
+        inProgress: TaskStatus.IN_PROGRESS,
+        pending: TaskStatus.PENDING,
+        high: TaskPriority.HIGH,
+        medium: TaskPriority.MEDIUM,
+        low: TaskPriority.LOW,
+        // userId parameter is added conditionally above if needed
+        ...(user.role !== 'admin' && { userId: user.id })
+      });
 
-    // Inefficient computation (in-memory filtering) - WILL BE OPTIMIZED LATER
+    // Execute the query and get the raw results
+    const statsResult = await qb.getRawOne();
+
+    // Parse the raw results (which might be strings) into numbers
     const statistics = {
-      total: tasks.length,
-      completed: tasks.filter(t => t.status === TaskStatus.COMPLETED).length,
-      inProgress: tasks.filter(t => t.status === TaskStatus.IN_PROGRESS).length,
-      pending: tasks.filter(t => t.status === TaskStatus.PENDING).length,
-      // Add priority stats if needed, requires TaskPriority enum import
-      highPriority: tasks.filter(t => t.priority === TaskPriority.HIGH).length,
-      mediumPriority: tasks.filter(t => t.priority === TaskPriority.MEDIUM).length,
-      lowPriority: tasks.filter(t => t.priority === TaskPriority.LOW).length,
+      total: parseInt(statsResult.total, 10) || 0,
+      completed: parseInt(statsResult.completed, 10) || 0,
+      inProgress: parseInt(statsResult.inProgress, 10) || 0,
+      pending: parseInt(statsResult.pending, 10) || 0,
+      highPriority: parseInt(statsResult.highPriority, 10) || 0,
+      mediumPriority: parseInt(statsResult.mediumPriority, 10) || 0,
+      lowPriority: parseInt(statsResult.lowPriority, 10) || 0,
     };
 
     return statistics;
   }
 
-  async create(createTaskDto: CreateTaskDto, user: UserPayload): Promise<Task> { // <-- Accept UserPayload
-    const task = this.tasksRepository.create({
-      ...createTaskDto,
-      user: { id: user.id } // <-- Associate with logged-in user
-    });
-    // Note: You might want validation here to ensure required fields like title are present
-    const savedTask = await this.tasksRepository.save(task);
+  async create(createTaskDto: CreateTaskDto, user: UserPayload): Promise<Task> {
+    // Wrap operations in a transaction
+    return this.dataSource.transaction(async (transactionalEntityManager) => {
+      const task = transactionalEntityManager.create(Task, { // Use manager.create
+        ...createTaskDto,
+        user: { id: user.id }
+      });
+      const savedTask = await transactionalEntityManager.save(Task, task); // Use manager.save
 
-    // Consider transaction later
-    this.taskQueue.add('task-status-update', { /* ... */ });
+      // Add to queue WITHIN the transaction block
+      // Note: Potential distributed transaction issue if queue add fails AFTER commit starts
+      // or DB commit fails AFTER queue add succeeds. Simpler approach for now.
+      try {
+        await this.taskQueue.add('task-status-update', {
+          taskId: savedTask.id,
+          status: savedTask.status,
+        });
+      } catch (queueError) {
+          console.error("Failed to add task to queue, rolling back transaction", queueError);
+          // Throwing error here will cause the transaction manager to rollback
+          throw new Error(`Failed to add task ${savedTask.id} to queue.`);
+      }
 
-    // Ideally return a DTO, but returning entity for now (ensure password isn't exposed)
-    // We need to fetch the saved task again to get the user relation populated if needed client-side
-     const result = await this.tasksRepository.findOne({
-         where: { id: savedTask.id },
-         relations: { user: true },
-     });
-     if (!result) {
-         // Should not happen, but safety check
-         throw new NotFoundException('Failed to retrieve created task');
-     }
-     return result;
+      // Fetch and return the task with relation (using original repository or manager)
+      // Fetching outside might be safer if queue interaction inside TX is problematic
+      const result = await this.tasksRepository.findOne({ // Use main repo here is fine
+           where: { id: savedTask.id },
+           relations: { user: true },
+       });
+       if (!result) throw new NotFoundException('Failed to retrieve created task');
+       return result;
 
-    // return savedTask; // This won't have the user relation loaded
-  }
+    }); // End transaction block
+}
 
 // --- NEW METHOD for Paginated/Filtered FindAll ---
   /**
@@ -170,30 +201,48 @@ export class TasksService {
   }
 
 
-   // --- UPDATE (Optimize fetch & Add Auth Check) ---
-   async update(id: string, updateTaskDto: UpdateTaskDto, user: UserPayload): Promise<Task> { // <-- Accept UserPayload
-    // Fetch the task directly first, ensuring it exists and checking auth in one go
-    const task = await this.findOne(id, user); // Re-use findOne logic including auth check
-
-    // task is guaranteed to exist and be accessible by the user here due to findOne call
-
+  async update(id: string, updateTaskDto: UpdateTaskDto, user: UserPayload): Promise<Task> {
+    // 1. Check existence and authorization first (using the already fixed findOne)
+    const task = await this.findOne(id, user);
     const originalStatus = task.status;
 
-    // Apply updates using TypeORM's merge or Object.assign
-    // merge is slightly safer as it only considers properties defined in the entity
-    this.tasksRepository.merge(task, updateTaskDto);
+    // 2. Wrap the update and queue logic in a transaction
+    return this.dataSource.transaction(async (transactionalEntityManager) => {
+      // Apply updates using merge within the transaction
+      // Note: 'task' object is already loaded, merge applies dto changes onto it
+      transactionalEntityManager.merge(Task, task, updateTaskDto);
 
-    // Save the merged entity
-    const updatedTask = await this.tasksRepository.save(task);
+      // Save using the transactional entity manager
+      const updatedTask = await transactionalEntityManager.save(Task, task); // Pass class and entity
 
-    // Consider transaction later
-    if (updateTaskDto.status && originalStatus !== updatedTask.status) {
-      this.taskQueue.add('task-status-update', { /* ... */ });
-    }
+      // Add to queue if status changed, WITHIN the transaction block
+      if (updateTaskDto.status && originalStatus !== updatedTask.status) {
+        try {
+          await this.taskQueue.add('task-status-update', {
+            taskId: updatedTask.id,
+            status: updatedTask.status,
+          });
+        } catch (queueError) {
+          console.error("Failed to add updated task to queue, rolling back transaction", queueError);
+          // Throwing error here will cause the transaction manager to rollback
+          throw new Error(`Failed to add updated task ${updatedTask.id} to queue.`);
+        }
+      }
+      // Important: Return the task *after* potentially fetching relations again
+      // if the caller needs them and `save` doesn't return them eagerly with the manager.
+      // Fetching using the manager ensures it's part of the transaction snapshot.
+      const result = await transactionalEntityManager.findOne(Task, {
+           where: { id: updatedTask.id },
+           relations: { user: true }, // Re-fetch with relations if needed by client
+       });
+       if (!result) throw new NotFoundException('Failed to retrieve updated task'); // Should not happen
+       return result;
 
-    return updatedTask; // Consider returning DTO
+      // Or if relations aren't needed, simply: return updatedTask; (less safe if save result differs)
+
+    }); // End transaction block
   }
-
+  
 // --- REMOVE (Optimize fetch & Add Auth Check) ---
 async remove(id: string, user: UserPayload): Promise<void> { // <-- Accept UserPayload
   // Fetch the task first, ensuring it exists and checking auth in one go
@@ -237,4 +286,61 @@ async remove(id: string, user: UserPayload): Promise<void> { // <-- Accept UserP
     // Fetching again without relation is safer if caller doesn't need user.
     return updatedTask;
   }
+
+  // --- ADD BATCH METHODS ---
+
+async batchUpdateStatus(taskIds: string[], status: TaskStatus, user: UserPayload): Promise<{ affected: number }> {
+  // 1. Authorization Check (if not admin)
+  if (user.role !== 'admin') {
+      // Find how many of the requested IDs actually belong to the user
+      const ownedCount = await this.tasksRepository.count({
+          where: {
+              id: In(taskIds), // Check only within the requested IDs
+              user: { id: user.id }
+          }
+      });
+      // If the count doesn't match, the user tried to update tasks they don't own
+      if (ownedCount !== taskIds.length) {
+          // For simplicity, deny the whole operation. Could also filter IDs.
+          throw new ForbiddenException('You do not have permission to update one or more of the specified tasks.');
+      }
+  }
+
+  // 2. Perform Bulk Update
+  // Add user filter again for non-admins as an extra safety layer in the update itself
+  const updateCriteria: FindOptionsWhere<Task> = { id: In(taskIds) };
+  if (user.role !== 'admin') {
+      updateCriteria.user = { id: user.id };
+  }
+
+  const result = await this.tasksRepository.update(updateCriteria, { status });
+
+  // TODO: Consider adding a single batch job to the queue if needed
+
+  return { affected: result.affected ?? 0 };
+}
+
+async batchDelete(taskIds: string[], user: UserPayload): Promise<{ affected: number }> {
+  // 1. Authorization Check (if not admin)
+  if (user.role !== 'admin') {
+      const ownedCount = await this.tasksRepository.count({
+          where: {
+              id: In(taskIds),
+              user: { id: user.id }
+          }
+      });
+      if (ownedCount !== taskIds.length) {
+          throw new ForbiddenException('You do not have permission to delete one or more of the specified tasks.');
+      }
+  }
+
+  // 2. Perform Bulk Delete
+  const deleteCriteria: FindOptionsWhere<Task> = { id: In(taskIds) };
+   if (user.role !== 'admin') {
+       deleteCriteria.user = { id: user.id };
+   }
+  const result = await this.tasksRepository.delete(deleteCriteria);
+
+  return { affected: result.affected ?? 0 };
+}
 }

@@ -1,4 +1,3 @@
-// src/modules/tasks/tasks.controller.ts
 import {
   Controller, Get, Post, Body, Patch, Param, Delete, UseGuards, Query,
   HttpException, HttpStatus, UseInterceptors, Req, UnauthorizedException, // <-- Added UnauthorizedException
@@ -132,52 +131,55 @@ export class TasksController {
     // No content is returned for 204
   }
 
-  // --- BATCH PROCESS ---
-  @Post('batch')
-  @ApiOperation({ summary: 'Batch process multiple tasks' })
-  async batchProcess(
-      @Body() operations: { tasks: string[], action: string },
-      @Req() req: UserInRequest // <-- Inject Req
-  ) {
+// --- REFACTORED BATCH PROCESS ---
+@Post('batch')
+@ApiOperation({ summary: 'Batch process multiple tasks (update status or delete)' })
+async batchProcess(
+    @Body() operations: { tasks: string[], action: string; status?: TaskStatus }, // Allow passing status for 'complete' etc.
+    @Req() req: UserInRequest
+) {
     const user = req.user;
-    if (!user) {
-      throw new UnauthorizedException();
-    }
+    if (!user) throw new UnauthorizedException();
 
-    // TODO: Refactor this entire endpoint to use a dedicated service method
-    // that performs bulk authorization checks *before* executing bulk DB operations.
-    // The current loop performs N+1 authorization checks and N+1 DB operations.
-
-    // --- Keeping placeholder N+1 logic with per-call auth for now ---
     const { tasks: taskIds, action } = operations;
-    const results = [];
-    for (const taskId of taskIds) {
-      try {
-        let result;
-        switch (action) {
-          case 'complete':
-             // Pass user - service will check auth for EACH task (N+1 problem remains)
-            result = await this.tasksService.update(taskId, { status: TaskStatus.COMPLETED }, user);
-            break;
-          case 'delete':
-             // Pass user - service will check auth for EACH task (N+1 problem remains)
-            await this.tasksService.remove(taskId, user); // remove is void
-            result = { id: taskId, deleted: true }; // Provide some result indication
-            break;
-          default:
-            throw new HttpException(`Unknown action: ${action}`, HttpStatus.BAD_REQUEST);
-        }
-        results.push({ taskId, success: true, result });
-      } catch (error) {
-         results.push({
-           taskId,
-           success: false,
-           error: error instanceof Error ? error.message : 'Unknown error',
-           status: error instanceof HttpException ? error.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR // Provide status
-         });
-      }
+
+    if (!taskIds || taskIds.length === 0) {
+        throw new HttpException('No task IDs provided for batch operation', HttpStatus.BAD_REQUEST);
     }
-    return results;
-    // --- End placeholder N+1 logic ---
-  }
+
+    try {
+        let result: { affected: number };
+        switch (action.toLowerCase()) { // Use lowercase for case-insensitivity
+            case 'complete':
+                // You might want specific DTO validation to ensure status is COMPLETED here
+                result = await this.tasksService.batchUpdateStatus(taskIds, TaskStatus.COMPLETED, user);
+                break;
+             case 'set_status': // Example for setting arbitrary status
+                 if (!operations.status || !Object.values(TaskStatus).includes(operations.status)) {
+                     throw new HttpException(`Invalid or missing status provided for action: ${action}`, HttpStatus.BAD_REQUEST);
+                 }
+                 result = await this.tasksService.batchUpdateStatus(taskIds, operations.status, user);
+                 break;
+            case 'delete':
+                result = await this.tasksService.batchDelete(taskIds, user);
+                break;
+            default:
+                throw new HttpException(`Unknown batch action: ${action}`, HttpStatus.BAD_REQUEST);
+        }
+        // Return a summary response
+        return {
+            action: action,
+            success: true,
+            affectedCount: result.affected,
+            requestedCount: taskIds.length,
+        };
+    } catch (error) {
+        // Catch errors thrown by the service (e.g., ForbiddenException) or others
+        if (error instanceof HttpException) {
+            throw error; // Re-throw known HTTP exceptions
+        }
+        console.error("Batch processing error:", error); // Log unexpected errors
+        throw new HttpException('Batch operation failed', HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+}
 }
